@@ -16,4 +16,6 @@ COPY maps /app/maps
 RUN python -m compileall -q /app/br && chmod -R a+rX /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app SKIP_INTEGRATION=0 BR_SQLGLOT=/opt/sqlglot BR_MAPS=/app/maps
+# experiment: only cheap verifications
+ENV BR_MAX_VERIFY_CPU=2
 CMD ["python", "-m", "br.main"]
