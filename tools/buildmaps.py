@@ -151,6 +151,8 @@ def main():
             for f, ls in d[key].items():
                 m = files.setdefault(f, {})
                 for line in ls:
+                    if line <= 0:  # synthetic line-0 event of empty modules
+                        continue
                     m.setdefault(line, ([], []))[ki].append(k)
         for key in d.get("uses", []):
             usage.setdefault(key, []).append(k)

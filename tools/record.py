@@ -57,8 +57,26 @@ def child(root, test, outdir):
             s.add(line)
         return DIS
 
+    from entrylines import entry_lines
+
+    def on_start(code, offset):
+        # no LINE event is reported for code on the definition line: attribute those lines on entry
+        if code.co_flags & OPT:
+            f = code.co_filename
+            r = cache.get(f)
+            if r is None:
+                r = f[len(prefix):] if f.startswith(prefix) and f.endswith(".py") else False
+                cache[f] = r
+            if r:
+                s = fn.get(r)
+                if s is None:
+                    s = fn[r] = set()
+                s.update(entry_lines(code))
+        return DIS
+
     mon.register_callback(tool, mon.events.LINE, on_line)
-    mon.set_events(tool, mon.events.LINE)
+    mon.register_callback(tool, mon.events.PY_START, on_start)
+    mon.set_events(tool, mon.events.LINE | mon.events.PY_START)
 
     import classhook
     classhook.install(root)

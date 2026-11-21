@@ -34,6 +34,7 @@ EST_SCALE = float(os.environ.get("BR_EST_SCALE", "0.15"))     # verify if est cp
 DATA_STATIC = os.environ.get("BR_DATA_STATIC", "1") == "1"            # data-only patches: emit readers without verifying
 WARM = os.environ.get("BR_WARM", "1") == "1"                          # pre-import unpatched sqlglot core in the parent
 CLASS_NARROW = os.environ.get("BR_CLASS_NARROW", "1") == "1"          # class-body changes: only tests using the class
+CLASS_SPAN = os.environ.get("BR_CLASS_SPAN", "0") == "1"              # also count tests running code inside the class body
 CLASS_SPAN_MAX = int(os.environ.get("BR_CLASS_SPAN_MAX", "1500"))
 REF_NARROW = os.environ.get("BR_REF_NARROW", "1") == "1"              # constant assignments: only tests running code that mentions the name
 SLICE = os.environ.get("BR_SLICE", "1") == "1"                        # run only the affected fixture entries of loop tests
@@ -150,8 +151,9 @@ def _class_users(ctx, path, old_lines):
                 fpath = fam.split("::")[0]
                 if span is None or span[1] - span[0] > CLASS_SPAN_MAX:
                     return None
-                for l in range(span[0], span[1] + 1):
-                    out |= maps.tests_for(fpath, l, "fn")
+                if CLASS_SPAN:
+                    for l in range(span[0], span[1] + 1):
+                        out |= maps.tests_for(fpath, l, "fn")
             out |= maps.tests_using_class(key)
         return ctx.tr(out)
     except Exception:
