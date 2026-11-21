@@ -163,3 +163,30 @@ def base_cpu(test_number):
 def fixture_files(test_number):
     t = _get(test_number)
     return list(t.files) if t else []
+
+
+def full_cpu(test_number):
+    """Unmonitored CPU seconds of the full test in a fresh forked child (inline pools)."""
+    t = _get(test_number)
+    return t.raw.get("fcpu", 0.0) if t else 0.0
+
+
+def est_cpu(test_number, selection):
+    """Estimated CPU seconds of a slice. selection: {fixture_arg: iterable of entry indices}.
+    entry_cpu values contain a cold-start overhead per entry, so they are only used as weights:
+    base + (full - base) * (selected weight / total weight)."""
+    t = _get(test_number)
+    if t is None:
+        return 0.0
+    base, full = t.raw["bcpu"], t.raw.get("fcpu", 0.0)
+    tot = sel = 0.0
+    for fx, fe in t.files.items():
+        if fe.get("u") or "cpu" not in fe:
+            continue
+        w = fe["cpu"]
+        tot += sum(w) + 1e-9 * len(w)
+        s = selection.get(fx, ())
+        sel += sum(w[i] for i in s if i < len(w)) + 1e-9 * len(s)
+    if tot <= 0:
+        return full
+    return base + max(0.0, full - base) * min(1.0, sel / tot)

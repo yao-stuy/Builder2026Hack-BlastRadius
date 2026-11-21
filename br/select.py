@@ -11,7 +11,9 @@ Anything unexpected widens the answer (up to the full suite); nothing here may g
 """
 from __future__ import annotations
 
+import ast
 import os
+import re
 import time
 
 from br import classify, diffparse, maps, pack
@@ -31,6 +33,7 @@ DATA_STATIC = os.environ.get("BR_DATA_STATIC", "1") == "1"            # data-onl
 WARM = os.environ.get("BR_WARM", "1") == "1"                          # pre-import unpatched sqlglot core in the parent
 CLASS_NARROW = os.environ.get("BR_CLASS_NARROW", "1") == "1"          # class-body changes: only tests using the class
 CLASS_SPAN_MAX = int(os.environ.get("BR_CLASS_SPAN_MAX", "1500"))
+REF_NARROW = os.environ.get("BR_REF_NARROW", "1") == "1"              # constant assignments: only tests running code that mentions the name
 NEED_3P = ("tests/test_executor.py", "tests/test_optimizer.py")
 
 
@@ -133,6 +136,77 @@ def _class_users(ctx, path, old_lines):
         return None
 
 
+_CONST = re.compile(r"^[A-Z][A-Z0-9_]{3,}$")
+_REFS = None
+
+
+def _refs():
+    """Prebuilt index: constant-style name -> [(file, first line of statement, line of mention)]."""
+    global _REFS
+    if _REFS is None:
+        import json
+        import zlib
+        with open(os.path.join(MAPS, "refs.json.z"), "rb") as f:
+            d = json.loads(zlib.decompress(f.read()))
+        _REFS = (d["files"], d["refs"])
+    return _REFS
+
+
+def _ref_users(ctx, path, old_text, old_lines):
+    """The changed statements are plain constant assignments (NAME = value) at class or module level.
+    Such a value can only matter to tests that run some code mentioning NAME. Find every line in the
+    tree that mentions NAME (textually, so comments and strings count too) and return the tests that
+    execute any of those lines. Returns None when the change is not of that simple form."""
+    try:
+        tree = ast.parse(old_text)
+        names = set()
+        own = set()
+        todo = [tree]
+        hit = set()
+        while todo:
+            node = todo.pop()
+            for st in getattr(node, "body", []):
+                lo, hi = st.lineno, getattr(st, "end_lineno", st.lineno)
+                if isinstance(st, ast.ClassDef):
+                    if any(lo <= ln <= hi for ln in old_lines):
+                        # header/decorator lines of the class itself are not a constant assignment
+                        if any(ln < st.body[0].lineno for ln in old_lines if lo <= ln <= hi):
+                            return None
+                        todo.append(st)
+                    continue
+                if not any(lo <= ln <= hi for ln in old_lines):
+                    continue
+                tgt = None
+                if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+                    tgt = st.targets[0].id
+                elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.value is not None:
+                    tgt = st.target.id
+                if tgt is None or not _CONST.match(tgt):
+                    return None
+                names.add(tgt)
+                own.update(range(lo, hi + 1))
+                hit.update(ln for ln in old_lines if lo <= ln <= hi)
+        if not names or hit != set(old_lines):
+            return None
+        out = set()
+        files, refs = _refs()
+        recorded = {}
+        for n in names:
+            for fi, first, last in refs.get(n, ()):
+                f = files[fi]
+                if f == path and first in own:
+                    continue
+                rec = recorded.get(f)
+                if rec is None:
+                    rec = recorded[f] = maps.lines(f) if maps.known_file(f) else set()
+                for k in range(first, last + 1):
+                    if k in rec:
+                        out |= maps.tests_for(f, k, "any")
+        return ctx.tr(out)
+    except Exception:
+        return None
+
+
 def analyze(ctx, text):
     """-> (candidates: set[int], certain: bool, changes: dict[path, bytes|None], notes: list[str])"""
     try:
@@ -206,12 +280,19 @@ def analyze(ctx, text):
                     if imp.level == "top" and CLASS_NARROW:
                         narrowed = _class_users(ctx, old_p, imp.old_lines)
                     if narrowed is not None:
-                        c |= narrowed
+                        cc = set(narrowed)
                     else:
+                        cc = set()
                         for ln in imp.old_lines:
-                            c |= ctx.tr(maps.tests_for(old_p, ln, kind))
-                    notes.append(f"{p}: lines/{imp.level}{'/cls' if narrowed is not None else ''} "
-                                 f"{sorted(imp.old_lines)[:6]} -> {len(c)}")
+                            cc |= ctx.tr(maps.tests_for(old_p, ln, kind))
+                    refs = None
+                    if imp.level == "top" and REF_NARROW and cc:
+                        refs = _ref_users(ctx, old_p, old_text, imp.old_lines)
+                        if refs is not None:
+                            cc &= refs
+                    c |= cc
+                    notes.append(f"{p}: lines/{imp.level}{'/cls' if narrowed is not None else ''}"
+                                 f"{'/ref' if refs is not None else ''} {sorted(imp.old_lines)[:6]} -> {len(cc)}")
                 elif k == "syntax_error":
                     c |= ctx.tr(maps.tests_for_file(old_p, "any"))
                     certain = certain or bool(c)
