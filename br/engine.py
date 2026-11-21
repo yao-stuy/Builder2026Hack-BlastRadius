@@ -22,6 +22,7 @@ class VerifyResult:
     timed_out: bool = False
     suspect: str | None = None
     error: str | None = None
+    cpus: dict = field(default_factory=dict)
 
 
 def _parse_id(tid):
@@ -182,6 +183,8 @@ class Verifier:
                         started = m["s"]
                     elif "r" in m:
                         tid, o = m["r"], m["o"]
+                        if "c" in m:
+                            res.cpus[tid] = m["c"]
                         if res.results.get(tid) != "fail":
                             res.results[tid] = o
                         if o == "fail" and res.first_fail is None:
@@ -263,14 +266,14 @@ class Verifier:
             for grp in _groups(first):
                 for tid, o, _cpu in h.run(grp, stop_on_fail=False, timeout_s=tmo):
                     if o != "notrun":
-                        emit({"r": tid, "o": o})
+                        emit({"r": tid, "o": o, "c": round(_cpu, 3)})
             for grp in _groups([t for t in test_ids if t not in specials and t not in always]):
                 out = h.run(grp, stop_on_fail=stop_on_fail, timeout_s=tmo)
                 stop = False
                 for tid, o, _cpu in out:
                     if o == "notrun":
                         continue
-                    emit({"r": tid, "o": o})
+                    emit({"r": tid, "o": o, "c": round(_cpu, 3)})
                     if o == "fail" and stop_on_fail:
                         stop = True
                 if stop:

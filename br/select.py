@@ -44,6 +44,7 @@ MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
 GEN_MEM = "tests/test_generator.py::TestGenerator::test_generator_memory"
 EXECUTOR = "tests/test_executor.py::TestExecutor"
 NO_RUN = set() if ADAPT else {MAX_NODES}
+DEBUG = os.environ.get("BR_DEBUG", "0") == "1"
 NEED_3P = ("tests/test_executor.py", "tests/test_optimizer.py")
 
 
@@ -594,21 +595,28 @@ def decide(ctx, commit, text, deadline):
         info["how"] = f"static (est {e:.1f}s vs gain {gain:.1f}s of {static_cost:.1f}s)"
         return cand, info
 
-    # Fixture filters for sliced tests; a file some test needs whole stays unfiltered.
-    filt = {}
-    whole = set()
+    # Each sliced test gets its own fixture filter, switched on right before it runs. TestExecutor builds
+    # its query lists once in setUpClass, so that class gets one filter: the union over its sliced tests.
+    per_test = {}
+    exec_filter = {}
+    exec_whole = set()
     for n in V:
         sel = plan[n]
+        is_exec = ctx.cls_of[n] == EXECUTOR
         if sel is None:
-            fl = entrymaps.sliceable(n) if (SLICE and ctx.same and ctx.slice_ok) else None
-            for fx in (fl or ()):
+            if is_exec and SLICE and ctx.same and ctx.slice_ok:
+                for fx in (entrymaps.sliceable(n) or ()):
+                    if not entrymaps.unused(n, fx):
+                        exec_whole.add(fx)
+            continue
+        per_test[ctx.ids[n]] = sel
+        if is_exec:
+            for fx, st in sel.items():
                 if not entrymaps.unused(n, fx):
-                    whole.add(fx)
-        else:
-            for fx, s in sel.items():
-                filt.setdefault(fx, set()).update(s)
-    for fx in whole:
-        filt.pop(fx, None)
+                    exec_filter.setdefault(fx, set()).update(st)
+    for fx in exec_whole:
+        exec_filter.pop(fx, None)
+    filt = bool(per_test or exec_filter)
 
     ver, mir = _engine(ctx)
     order = _order(ctx, V, changes)
@@ -624,10 +632,35 @@ def decide(ctx, commit, text, deadline):
 
     def prepare(h):
         if filt:
+            import unittest
             slices.install()
-            slices.set_filter(filt)
+            orig_run = unittest.TestCase.run
+
+            def run(self, result=None):
+                cls = type(self)
+                tid = "%s::%s::%s" % (cls.__module__.replace(".", "/") + ".py", cls.__qualname__, self._testMethodName)
+                f = per_test.get(tid)
+                if f is None or cls.__qualname__ == "TestExecutor":
+                    slices.clear()
+                else:
+                    slices.set_filter(f)
+                return orig_run(self, result)
+
+            unittest.TestCase.run = run
         if lazy:
             adapters.install_executor_lazy()   # load TPC tables only when a test touches them
+        if exec_filter and any(ctx.cls_of[n] == EXECUTOR for n in V):
+            import tests.test_executor as te
+            inner = te.TestExecutor.setUpClass.__func__
+
+            def setup(cls):
+                slices.set_filter(exec_filter)
+                try:
+                    inner(cls)
+                finally:
+                    slices.clear()
+
+            te.TestExecutor.setUpClass = classmethod(setup)
 
     try:
         mir.apply(changes)
@@ -644,6 +677,12 @@ def decide(ctx, commit, text, deadline):
     passed = {ctx.num[i] for i, o in res.results.items() if o == "pass"}
     failed = {ctx.num[i] for i, o in res.results.items() if o != "pass"}
     pending = set(order) - passed - failed  # not run, or in progress when the child died
+    if res.died or res.error:
+        ctx.log(f"   child problem: died={res.died} timed_out={res.timed_out} error={res.error} suspect={res.suspect}")
+    if DEBUG and res.cpu_s > 2:
+        top = sorted(res.cpus.items(), key=lambda kv: -kv[1])[:8]
+        ctx.log("   cpu by test: " + ", ".join(f"{t.split('::')[-1]}={c:.2f}(est {vcost.get(ctx.num[t], 0):.2f})" for t, c in top)
+                + f" | sum {sum(res.cpus.values()):.1f} of {res.cpu_s:.1f}")
     nsl = sum(1 for n in V if plan[n] is not None)
     if failed or pending:
         # A sampled test that passed its sample is still emitted when something else failed.
