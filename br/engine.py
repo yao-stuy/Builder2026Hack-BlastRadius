@@ -113,12 +113,17 @@ class Verifier:
         return h
 
     # ------------------------------------------------------------------
-    def verify(self, test_ids, *, stop_on_fail=True, timeouts=None, wall_s=60.0, changed=None):
+    def verify(self, test_ids, *, stop_on_fail=True, timeouts=None, wall_s=60.0, changed=None,
+               prepare=None, specials=None):
+        """prepare(harness): called in the child after harness.setup, before any test runs.
+        specials: {test_id: callable -> "pass" | "fail" | None}; those ids are not run as tests,
+        the callable decides their outcome (None = no verdict). Specials run after the normal
+        tests and are not skipped by stop_on_fail."""
         test_ids = list(test_ids)
         res = VerifyResult()
         t0 = time.monotonic()
         try:
-            self._verify(test_ids, stop_on_fail, timeouts, wall_s, res, changed)
+            self._verify(test_ids, stop_on_fail, timeouts, wall_s, res, changed, prepare, specials or {})
         except BaseException as e:  # noqa: BLE001
             if isinstance(e, KeyboardInterrupt):
                 raise
@@ -130,7 +135,7 @@ class Verifier:
             res.suspect = res.not_run[0]
         return res
 
-    def _verify(self, test_ids, stop_on_fail, timeouts, wall_s, res, changed):
+    def _verify(self, test_ids, stop_on_fail, timeouts, wall_s, res, changed, prepare=None, specials=None):
         if not test_ids:
             return
         rfd, wfd = os.pipe()
@@ -141,7 +146,7 @@ class Verifier:
             os.close(wfd)
             raise
         if pid == 0:
-            self._child(rfd, wfd, test_ids, stop_on_fail, timeouts, changed)  # never returns
+            self._child(rfd, wfd, test_ids, stop_on_fail, timeouts, changed, prepare, specials or {})  # never returns
         os.close(wfd)
         started = None
         buf = b""
@@ -182,6 +187,9 @@ class Verifier:
                             res.first_fail = tid
                         if started == tid:
                             started = None
+                    elif "x" in m:
+                        if started == m["x"]:
+                            started = None
                     elif "e" in m:
                         res.error = m["e"]
         finally:
@@ -208,7 +216,7 @@ class Verifier:
             res.suspect = started
 
     # ------------------------------------------------------------------
-    def _child(self, rfd, wfd, test_ids, stop_on_fail, timeouts, changed):
+    def _child(self, rfd, wfd, test_ids, stop_on_fail, timeouts, changed, prepare=None, specials=None):
         code = 1
         try:
             os.setsid()
@@ -241,13 +249,16 @@ class Verifier:
             self._purge_if_stale(changed)
             h = self._harness()
             h.setup(self.root)
+            specials = specials or {}
+            if prepare is not None:
+                prepare(h)
             self._install_hook(emit)
             if timeouts is None or callable(timeouts) or isinstance(timeouts, (int, float)):
                 tmo = timeouts
             else:
                 d = dict(timeouts)
                 tmo = lambda tid: d.get(tid)  # noqa: E731
-            for grp in _groups(test_ids):
+            for grp in _groups([t for t in test_ids if t not in specials]):
                 out = h.run(grp, stop_on_fail=stop_on_fail, timeout_s=tmo)
                 stop = False
                 for tid, o, _cpu in out:
@@ -258,6 +269,19 @@ class Verifier:
                         stop = True
                 if stop:
                     break
+            for tid in test_ids:
+                fn = specials.get(tid)
+                if fn is None:
+                    continue
+                emit({"s": tid})
+                try:
+                    o = fn()
+                except BaseException:  # noqa: BLE001
+                    o = None
+                if o in ("pass", "fail"):
+                    emit({"r": tid, "o": o})
+                else:
+                    emit({"x": tid})
             code = 0
         except BaseException as e:  # noqa: BLE001
             try:
