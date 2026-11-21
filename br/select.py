@@ -17,7 +17,7 @@ import re
 import sys
 import time
 
-from br import adapters, classify, diffparse, entrymaps, maps, pack, slices
+from br import adapters, classify, cmptypes, diffparse, entrymaps, maps, pack, slices
 
 ROOT = os.environ.get("BR_SQLGLOT", "/opt/sqlglot")
 MAPS = os.environ.get("BR_MAPS", "/app/maps")
@@ -72,6 +72,7 @@ ADD_NOOP = os.environ.get("BR_ADD_NOOP", "1") == "1"                  # unused m
 RUNNER_FILES = {"conftest.py", "pytest.ini", "tox.ini", "sitecustomize.py", "usercustomize.py", ".coveragerc"}
 PYTEST_KEYS = {"addopts", "filterwarnings", "testpaths", "python_files", "python_classes", "python_functions",
                "markers", "xfail_strict", "timeout", "norecursedirs", "required_plugins", "pythonpath"}
+ISEQ = os.environ.get("BR_ISEQ", "1") == "1"                          # prove is/== swaps equivalent from operand types
 NEED_3P = ("tests/test_executor.py", "tests/test_optimizer.py")
 
 
@@ -362,6 +363,26 @@ def _key_users(ctx, old_text, old_lines):
         return None
 
 
+def _only_is_eq_swaps(fp):
+    """Cheap textual gate: every changed line pair differs only by `is`<->`==` / `is not`<->`!=`."""
+    try:
+        def norm(t):
+            return " ".join(t.replace(" is not ", " != ").replace(" is ", " == ").split())
+        any_pair = False
+        for h in fp.hunks:
+            old = [ln.text for ln in h.lines if ln.tag == "-"]
+            new = [ln.text for ln in h.lines if ln.tag == "+"]
+            if len(old) != len(new) or not old:
+                return False
+            for a, b in zip(old, new):
+                if a == b or norm(a) != norm(b):
+                    return False
+                any_pair = True
+        return any_pair
+    except Exception:
+        return False
+
+
 def _strip_strings(tree):
     for node in ast.walk(tree):
         body = getattr(node, "body", None)
@@ -629,6 +650,12 @@ def analyze(ctx, text):
                     certain = certain or bool(c)
                 notes.append(f"{p}: {fp.status} ({len(c)})")
             else:
+                if ISEQ and _only_is_eq_swaps(fp) and cmptypes.provably_equivalent(old_p, old_text, new_text):
+                    # Only `is`/`==` (or `is not`/`!=`) were exchanged, and for every type that reaches these
+                    # comparisons in any test the two operators are the same function: no behavior change.
+                    notes.append(f"{p}: equivalent comparison")
+                    cand |= c
+                    continue
                 imp = classify.classify(old_p, old_text, new_text, fp)
                 k = imp.kind
                 if (k == "whole_file" and ADD_NOOP and not diffparse.removed_old_lines(fp)
