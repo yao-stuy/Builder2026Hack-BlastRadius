@@ -27,7 +27,7 @@ TMP = os.environ.get("BR_TMP", "/tmp/br")
 HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", "2500"))          # tests at least this long are never run by us
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"               # dynamic verification on/off
 HEAVY_WHEN_CLEAN = os.environ.get("BR_HEAVY_WHEN_CLEAN", "include")  # include | exclude
-MAX_VERIFY_CPU = float(os.environ.get("BR_MAX_VERIFY_CPU", "15"))     # per-commit cap on estimated verify CPU
+MAX_VERIFY_CPU = float(os.environ.get("BR_MAX_VERIFY_CPU", "30"))     # per-commit cap on estimated verify CPU (scoring-machine seconds)
 VERIFY_FACTOR = float(os.environ.get("BR_VERIFY_FACTOR", "0.85"))
 # Estimates are in seconds of the scoring machine, which runs about 3x faster than the recording machine.
 EST_SCALE = float(os.environ.get("BR_EST_SCALE", "0.33"))     # verify if est cpu <= factor * static cost
@@ -58,6 +58,10 @@ CONTINUE = os.environ.get("BR_CONTINUE", "1") == "1"                  # keep ver
 CONT_FACTOR = float(os.environ.get("BR_CONT_FACTOR", "0.6"))
 REL_CPU = float(os.environ.get("BR_REL_CPU", "3.0"))
 POOL_SPLIT = os.environ.get("BR_POOL_SPLIT", "1") == "1"
+# The scoring machine spends more CPU than our per-test estimates say: measured factors, used only when
+# weighing a verification's CPU against the test seconds it can save (never to choose slices or samples).
+POOL_F = float(os.environ.get("BR_POOL_F", "3.5"))                 # optimizer/executor loop tests
+ORD_F = float(os.environ.get("BR_ORD_F", "1.5"))                   # every other test
 AUDIT = os.environ.get("BR_AUDIT", "0") == "1"                        # test aid: verify everything, report verdicts
 AUDIT_CAP = float(os.environ.get("BR_AUDIT_CAP", "25"))
 ALWAYS = os.environ.get("BR_ALWAYS", "0") == "1"
@@ -1060,10 +1064,15 @@ def decide(ctx, commit, text, deadline):
                 plan[n], vcost[n] = smp
                 sampled.add(n)
 
-    def est(vs):
+    def est_raw(vs):
         fix = ctx.fixcost if lazy_ok else ctx.fix
         return 0.02 + sum(vcost[n] for n in vs) + EST_SCALE * sum(
             fix[c] for c in {ctx.cls_of[n] for n in vs} if c in POOL_CLASSES)
+
+    def est(vs):
+        # the same estimate in scoring-machine CPU seconds
+        fix = ctx.fixcost if lazy_ok else ctx.fix
+        return 0.02 + sum(vcost[n] * (POOL_F if ctx.cls_of[n] in POOL_CLASSES else ORD_F) for n in vs)             + POOL_F * EST_SCALE * sum(fix[c] for c in {ctx.cls_of[n] for n in vs} if c in POOL_CLASSES)
 
     # Leave out of verification the tests that cost more to run than to simply emit.
     V = set(vcost)
@@ -1086,8 +1095,9 @@ def decide(ctx, commit, text, deadline):
             best = j
     gain = static_cost - _cost(ctx, U)
     e = est(V)
-    too_much = (e > AUDIT_CAP) if AUDIT else (e > MAX_VERIFY_CPU or e > VERIFY_FACTOR * gain)
-    if (not VERIFY or not V or too_much or time.time() + e * 4 + 5 > deadline):
+    e_raw = est_raw(V)
+    too_much = (e_raw > AUDIT_CAP) if AUDIT else (e > MAX_VERIFY_CPU or e > VERIFY_FACTOR * gain)
+    if (not VERIFY or not V or too_much or time.time() + e_raw * 4 + 5 > deadline):
         info["how"] = f"static (est {e:.1f}s vs gain {gain:.1f}s of {static_cost:.1f}s)"
         return cand | _probe_only(ctx, changes, deadline), info
 
@@ -1124,7 +1134,7 @@ def decide(ctx, commit, text, deadline):
     if any(ctx.file_of[n] in NEED_3P for n in order):
         ver.ensure_preloaded(("duckdb", "pandas", "numpy"))
     timeouts = {ctx.ids[n]: max(3.0, 8 * ctx.cpu[n]) for n in order}
-    wall = min(max(10.0, e * 12 + 10), max(1.0, deadline - time.time() - 3))
+    wall = min(max(10.0, e_raw * 12 + 10), max(1.0, deadline - time.time() - 3))
 
     # Lazy table loading skips set-up work the selected tests do not need. That is only faithful when the
     # patch cannot break the set-up itself: nothing under tests/ changed, and the change is not in code that
@@ -1212,7 +1222,8 @@ def decide(ctx, commit, text, deadline):
         if CONTINUE and failed and pending and not broken:
             rest = est(pending)
             saved = _cost(ctx, failed | pending | U) - _cost(ctx, failed | U)
-            if rest <= CONT_FACTOR * saved and rest <= MAX_VERIFY_CPU and time.time() + rest * 4 + 5 < deadline:
+            if (rest <= CONT_FACTOR * saved and rest <= MAX_VERIFY_CPU
+                    and time.time() + est_raw(pending) * 4 + 5 < deadline):
                 more = [i for i in ids if ctx.num[i] in pending]
                 res = go(more, more, False)
                 results.update(res.results)

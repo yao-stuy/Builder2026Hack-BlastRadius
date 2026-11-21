@@ -37,6 +37,9 @@ what really fails.
    than what the candidates would cost to emit, the patch is applied to a symlink mirror of the sources and
    the candidates run in a forked child with a small `unittest` runner (same outcomes as pytest: failures,
    errors, failing subtests, import errors, timeouts). Tests that pass are dropped.
+   - The CPU estimate is weighed in scoring-machine seconds: a calibration run showed that machine spends
+     about 1.5x our estimate on ordinary tests and about 3.5x on the optimizer/executor loop tests
+     (`BR_ORD_F`, `BR_POOL_F` in `br/select.py`), so expensive verifications are skipped more often.
    - Loop-style tests (fixture-driven optimizer and executor tests) run only the fixture entries that
      execute a changed line, or that were themselves changed (`br/slices.py`, `br/entrymaps.py`).
    - The slowest tests are never run in full. `test_max_nodes` is checked with a scaled-down copy of its
