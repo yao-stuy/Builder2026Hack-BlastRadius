@@ -26,6 +26,7 @@ VERIFY = os.environ.get("BR_VERIFY", "1") == "1"               # dynamic verific
 HEAVY_WHEN_CLEAN = os.environ.get("BR_HEAVY_WHEN_CLEAN", "include")  # include | exclude
 MAX_VERIFY_CPU = float(os.environ.get("BR_MAX_VERIFY_CPU", "8"))     # per-commit cap on estimated verify CPU
 VERIFY_FACTOR = float(os.environ.get("BR_VERIFY_FACTOR", "1.0"))     # verify if est cpu <= factor * static cost
+DATA_STATIC = os.environ.get("BR_DATA_STATIC", "1") == "1"            # data-only patches: emit readers without verifying
 NEED_3P = ("tests/test_executor.py", "tests/test_optimizer.py")
 
 
@@ -91,6 +92,7 @@ def analyze(ctx, text):
     if not fps:
         raise Full("empty patch")
     cand = set(ctx.unmapped)
+    py_impact = bool(ctx.unmapped)
     certain = False
     changes = {}
     notes = []
@@ -162,8 +164,10 @@ def analyze(ctx, text):
                     notes.append(f"{p}: {k} {imp.reason[:40]} ({len(c)})")
         else:
             notes.append(f"{p}: data file ({len(c)})")
+        if is_py and c:
+            py_impact = True
         cand |= c
-    return cand, certain, changes, notes
+    return cand, certain, changes, notes, py_impact
 
 
 def _order(ctx, light, changes):
@@ -193,13 +197,17 @@ def _engine(ctx):
 
 
 def decide(ctx, commit, text, deadline):
-    cand, certain, changes, notes = analyze(ctx, text)
+    cand, certain, changes, notes, py_impact = analyze(ctx, text)
     info = {"cand": len(cand), "notes": notes, "verified": 0, "cpu": 0.0, "how": ""}
     if not cand:
         info["how"] = "no candidates"
         return set(), info
     if certain:
         info["how"] = "certain"
+        return cand, info
+    if DATA_STATIC and not py_impact:
+        # A changed fixture almost always breaks the test that reads it; running it first only costs CPU.
+        info["how"] = "data file change, static"
         return cand, info
     heavy = {n for n in cand if ctx.ms[n] >= HEAVY_MS}
     unrel = (cand - heavy) & ctx.unreliable

@@ -13,7 +13,7 @@ for c in sorted(ans):
     truth = set(ans[c]["failing"]); tot += 1
     try:
         text = open(f"{d}/commits/{c}.patch", "rb").read().decode("utf-8", errors="surrogateescape")
-        cand, certain, changes, notes = select.analyze(ctx, text)
+        cand, certain, changes, notes, _ = select.analyze(ctx, text)
     except select.Full as e:
         full += 1
         if "--show" in sys.argv: print(c, ans[c]["kind"], "FULL", e)
