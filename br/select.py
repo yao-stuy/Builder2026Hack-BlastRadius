@@ -66,6 +66,9 @@ HEADER_NARROW = os.environ.get("BR_HEADER_NARROW", "1") == "1"        # function
 NO_HEADER_NARROW = {"sqlglot/executor/env.py"}                         # its functions' signatures are inspected, not just called
 TOP_SLICE = os.environ.get("BR_TOP_SLICE", "1") == "1"                # slice loop tests for class-level changes too
 ADD_NOOP = os.environ.get("BR_ADD_NOOP", "1") == "1"                  # unused module-level additions are no-ops
+RUNNER_FILES = {"conftest.py", "pytest.ini", "tox.ini", "sitecustomize.py", "usercustomize.py", ".coveragerc"}
+PYTEST_KEYS = {"addopts", "filterwarnings", "testpaths", "python_files", "python_classes", "python_functions",
+               "markers", "xfail_strict", "timeout", "norecursedirs", "required_plugins", "pythonpath"}
 NEED_3P = ("tests/test_executor.py", "tests/test_optimizer.py")
 
 
@@ -485,6 +488,15 @@ def analyze(ctx, text):
         if p is None:
             raise Full("no path")
         is_py = p.endswith(".py") or (new_p or "").endswith(".py")
+        for q in {old_p, new_p} - {None}:
+            base = q.rsplit("/", 1)[-1]
+            # Files that change how every test is collected or imported: no narrowing is possible.
+            if base in RUNNER_FILES or base.endswith(".pth"):
+                raise Full(f"test-runner configuration changed: {q}")
+            if q.endswith(".py") and "/" not in q and fp.status != "modify":
+                raise Full(f"top-level module added or removed: {q}")   # may shadow a library module
+            if base in ("pyproject.toml", "setup.cfg") and _pytest_section_touched(fp):
+                raise Full(f"pytest settings changed in {q}")
         if fp.binary:
             readers = ctx.tr(maps.tests_reading(p)) if old_p else frozenset()
             if readers or maps.known_file(p) or is_py:
@@ -776,6 +788,25 @@ def _touches_executor_setup(ctx, changes):
             if q.endswith(".py"):
                 users |= ctx.tr(maps.tests_for_file(q, "any")) if maps.known_file(q) else set(ctx.all)
             if any(ctx.cls_of[n] == EXECUTOR for n in users):
+                return True
+        return False
+    except Exception:
+        return True
+
+
+def _pytest_section_touched(fp):
+    """Does the patch add, remove or change a line that mentions pytest, or sit inside a pytest section?"""
+    try:
+        section = ""
+        for h in fp.hunks:
+            for ln in h.lines:
+                t = ln.text.strip()
+                if t.startswith("[") and t.endswith("]"):
+                    section = t.lower()
+                if ln.tag in "+-" and ("pytest" in t.lower() or "pytest" in section):
+                    return True
+            # a hunk may start inside a section whose header is above the context: be careful with options
+            if any(ln.tag in "+-" and ln.text.split("=")[0].strip().lower() in PYTEST_KEYS for ln in h.lines):
                 return True
         return False
     except Exception:
