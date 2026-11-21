@@ -113,6 +113,7 @@ class Ctx:
         self.fixcost = dict(self.fix)      # what a class fixture costs once per verification run
         if ADAPT and EXECUTOR in self.fixcost:
             self.fixcost[EXECUTOR] = min(self.fixcost[EXECUTOR], 0.4)
+        self.n_exec = sum(1 for c in self.cls_of.values() if c == EXECUTOR)
         self.slice_ok = True
         self.last = ([], {})
         self.probes = []
@@ -827,6 +828,8 @@ def decide(ctx, commit, text, deadline):
         info["how"] = "data file change, static"
         return cand | _probe_only(ctx, changes, deadline), info
     static_cost = _cost(ctx, cand)
+    lazy_ok = (ADAPT and not any(q.startswith("tests/") for q in changes)
+               and sum(1 for n in cand if ctx.cls_of[n] == EXECUTOR) < ctx.n_exec)
 
     # Per-test plan and estimated CPU to verify it.
     plan = {}
@@ -873,8 +876,9 @@ def decide(ctx, commit, text, deadline):
                 sampled.add(n)
 
     def est(vs):
+        fix = ctx.fixcost if lazy_ok else ctx.fix
         return 0.02 + sum(vcost[n] for n in vs) + EST_SCALE * sum(
-            ctx.fixcost[c] for c in {ctx.cls_of[n] for n in vs} if c in POOL_CLASSES)
+            fix[c] for c in {ctx.cls_of[n] for n in vs} if c in POOL_CLASSES)
 
     # Leave out of verification the tests that cost more to run than to simply emit.
     V = set(vcost)
@@ -928,7 +932,13 @@ def decide(ctx, commit, text, deadline):
     timeouts = {ctx.ids[n]: max(3.0, 8 * ctx.cpu[n]) for n in order}
     wall = min(max(10.0, e * 12 + 10), max(1.0, deadline - time.time() - 3))
 
-    lazy = ADAPT and any(ctx.cls_of[n] == EXECUTOR for n in V)
+    # Lazy table loading skips set-up work the selected tests do not need. That is only faithful when the
+    # patch cannot break the set-up itself: nothing under tests/ changed, and the change is not in code that
+    # every executor test runs (set-up code is covered by all of them).
+    exec_cand = sum(1 for n in cand if ctx.cls_of[n] == EXECUTOR)
+    lazy = (ADAPT and any(ctx.cls_of[n] == EXECUTOR for n in V)
+            and not any(q.startswith("tests/") for q in changes)
+            and exec_cand < ctx.n_exec)
 
     def prepare(h):
         if DUCK1 and "duckdb" in sys.modules:
