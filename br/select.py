@@ -51,6 +51,8 @@ POOL_CLASSES = {EXECUTOR, "tests/test_optimizer.py::TestOptimizer"}
 REC_SCALE = float(os.environ.get("BR_REC_SCALE", "0.72"))              # our CPU per recorded second, ordinary tests
 NO_RUN = set() if ADAPT else {MAX_NODES}
 DUCK1 = os.environ.get("BR_DUCK1", "0") == "1"
+CONTINUE = os.environ.get("BR_CONTINUE", "1") == "1"                  # keep verifying after a failure when it pays
+CONT_FACTOR = float(os.environ.get("BR_CONT_FACTOR", "0.6"))
 REL_CPU = float(os.environ.get("BR_REL_CPU", "3.0"))
 ALWAYS = os.environ.get("BR_ALWAYS", "0") == "1"
 DEBUG = os.environ.get("BR_DEBUG", "0") == "1"
@@ -876,6 +878,22 @@ def decide(ctx, commit, text, deadline):
         failed = {ctx.num[i] for i, o in results.items() if o != "pass" and i in ctx.num}
         passed = {ctx.num[i] for i, o in results.items() if o == "pass" and i in ctx.num}
         pending = set(order) - sampled - passed - failed
+        # Phase 1b: a failure stopped the run. Everything not yet verified would be emitted; keep verifying
+        # (without stopping) when that costs clearly less CPU than emitting those tests would.
+        if CONTINUE and failed and pending and not broken:
+            rest = est(pending)
+            saved = _cost(ctx, failed | pending | U) - _cost(ctx, failed | U)
+            if rest <= CONT_FACTOR * saved and rest <= MAX_VERIFY_CPU and time.time() + rest * 4 + 5 < deadline:
+                more = [i for i in ids if ctx.num[i] in pending]
+                res = go(more, more, False)
+                results.update(res.results)
+                cpus.update(res.cpus)
+                cpu += res.cpu_s
+                if res.died or res.error:
+                    ctx.log(f"   child problem: died={res.died} timed_out={res.timed_out} error={res.error} suspect={res.suspect}")
+                failed = {ctx.num[i] for i, o in results.items() if o != "pass" and i in ctx.num}
+                passed = {ctx.num[i] for i, o in results.items() if o == "pass" and i in ctx.num}
+                pending = set(order) - sampled - passed - failed
         # Phase 2: the sampled tests. One that is closely related to a test that already failed is kept
         # without running it. Related tests phase 1 did not reach are run now, so the decision rests on facts.
         second = []
