@@ -62,6 +62,7 @@ DOC_NOOP = os.environ.get("BR_DOC_NOOP", "1") == "1"
 HEADER_NARROW = os.environ.get("BR_HEADER_NARROW", "1") == "1"        # function-header changes: only tests entering the function
 NO_HEADER_NARROW = {"sqlglot/executor/env.py"}                         # its functions' signatures are inspected, not just called
 TOP_SLICE = os.environ.get("BR_TOP_SLICE", "1") == "1"                # slice loop tests for class-level changes too
+ADD_NOOP = os.environ.get("BR_ADD_NOOP", "1") == "1"                  # unused module-level additions are no-ops
 NEED_3P = ("tests/test_executor.py", "tests/test_optimizer.py")
 
 
@@ -356,6 +357,75 @@ def _strip_strings(tree):
     return tree
 
 
+def _only_unused_additions(path, old_text, new_text):
+    """True when the new module is the old one plus inserted top-level statements that only bind new
+    names nothing refers to: `import x` / `from x import y` of standard-library modules, plain functions,
+    and constant assignments."""
+    try:
+        old = _tree(path, old_text)
+        new = ast.parse(new_text)
+        olds = [ast.dump(st) for st in old.body]
+        added = []
+        i = 0
+        for st in new.body:
+            if i < len(olds) and ast.dump(st) == olds[i]:
+                i += 1
+            else:
+                added.append(st)
+        if i != len(olds) or not added:
+            return False
+        used = _NAMES.get(path)
+        if used is None:
+            used = set()
+            for node in ast.walk(old):
+                if isinstance(node, ast.Name):
+                    used.add(node.id)
+                elif isinstance(node, ast.Attribute):
+                    used.add(node.attr)
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    used.add(node.name)
+                elif isinstance(node, ast.alias):
+                    used.add((node.asname or node.name).split(".")[0])
+                elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.isidentifier():
+                    used.add(node.value)
+                elif isinstance(node, ast.arg):
+                    used.add(node.arg)
+            _NAMES[path] = used
+        import builtins
+        std = getattr(sys, "stdlib_module_names", frozenset())
+        for st in added:
+            names = []
+            if isinstance(st, ast.Import):
+                for a in st.names:
+                    if a.name.split(".")[0] not in std:
+                        return False
+                    names.append((a.asname or a.name).split(".")[0])
+            elif isinstance(st, ast.ImportFrom):
+                if st.level or not st.module or st.module.split(".")[0] not in std or st.module == "__future__":
+                    return False
+                for a in st.names:
+                    if a.name == "*":
+                        return False
+                    names.append(a.asname or a.name)
+            elif isinstance(st, ast.FunctionDef):
+                if st.decorator_list:
+                    return False
+                names.append(st.name)
+            elif isinstance(st, ast.Assign):
+                if not (len(st.targets) == 1 and isinstance(st.targets[0], ast.Name) and isinstance(st.value, ast.Constant)):
+                    return False
+                names.append(st.targets[0].id)
+            else:
+                return False
+            for n in names:
+                if n in used or n.startswith("__") or hasattr(builtins, n):
+                    return False
+        return True
+    except Exception:
+        return False
+
+
+_NAMES = {}
 _TREES = {}
 _SPANS = {}
 
@@ -457,7 +527,15 @@ def analyze(ctx, text):
             else:
                 imp = classify.classify(old_p, old_text, new_text, fp)
                 k = imp.kind
-                if (k in ("lines", "whole_file") and DOC_NOOP
+                if (k == "whole_file" and ADD_NOOP and not diffparse.removed_old_lines(fp)
+                        and _only_unused_additions(old_p, old_text, new_text)):
+                    # Only new, unreferenced module-level names were added (an import of a standard-library
+                    # module, a function, a constant). Existing code cannot see them; the import check below
+                    # still confirms the module loads.
+                    k = "noop"
+                    probes.append(old_p)
+                    notes.append(f"{p}: unused addition")
+                elif (k in ("lines", "whole_file") and DOC_NOOP
                         and _only_strings_differ(old_p, old_text, new_text, diffparse.removed_old_lines(fp))):
                     # Only docstrings / bare string statements changed. Nothing in the tree reads __doc__
                     # (checked at the pinned commit), so no listed test can observe it.
@@ -466,7 +544,7 @@ def analyze(ctx, text):
                 elif k == "noop":
                     pass
                 if k == "noop":
-                    if not notes or not notes[-1].startswith(p + ": docstring"):
+                    if not notes or not notes[-1].startswith(p + ": "):
                         notes.append(f"{p}: noop")
                 elif k == "lines":
                     level = imp.level
