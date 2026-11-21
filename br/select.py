@@ -72,7 +72,6 @@ ADD_NOOP = os.environ.get("BR_ADD_NOOP", "1") == "1"                  # unused m
 RUNNER_FILES = {"conftest.py", "pytest.ini", "tox.ini", "sitecustomize.py", "usercustomize.py", ".coveragerc"}
 PYTEST_KEYS = {"addopts", "filterwarnings", "testpaths", "python_files", "python_classes", "python_functions",
                "markers", "xfail_strict", "timeout", "norecursedirs", "required_plugins", "pythonpath"}
-CALIB = os.environ.get("BR_CALIB", "1") == "1"                        # EXPERIMENT: fixed extra workload
 ISEQ = os.environ.get("BR_ISEQ", "1") == "1"                          # prove is/== swaps equivalent from operand types
 NEED_3P = ("tests/test_executor.py", "tests/test_optimizer.py")
 
@@ -1324,23 +1323,4 @@ def run(data_dir, tests, commits, deadline, log):
         except Exception as e:  # noqa: BLE001
             log(f"{c}: FULL SUITE (internal error {e!r})")
     log(f"verify cpu total {ctx.cpu_spent:.2f}s")
-    if CALIB and time.time() + 75 < deadline:
-        _calibrate(ctx, log)
     return answers
-
-
-def _calibrate(ctx, log):
-    """EXPERIMENT (branch exp2, never the final entry): after all answers are computed, run a fixed set of
-    tests once on the unpatched tree. The extra CPU this adds to the run measures the scoring machine."""
-    try:
-        ver, _ = _engine(ctx)
-        ids = [ctx.ids[n] for n in sorted(ctx.ms)
-               if n % 2 == 0 and ctx.ms[n] < 1500 and "test_executor" not in ctx.ids[n]]
-        t = time.process_time()
-        r = ver.verify(ids, stop_on_fail=False, wall_s=60.0, changed=[])
-        bad = sum(1 for o in r.results.values() if o != "pass")
-        log(f"calibration: {len(r.results)} of {len(ids)} tests, child cpu {r.cpu_s:.2f}s, parent cpu "
-            f"{time.process_time() - t:.2f}s, not passing {bad}, recorded {sum(ctx.ms[ctx.num[i]] for i in ids) / 1000:.2f}s, "
-            f"own-map cpu {sum(ctx.cpu[ctx.num[i]] for i in ids):.2f}s")
-    except Exception as e:  # noqa: BLE001
-        log("calibration failed:", repr(e))
