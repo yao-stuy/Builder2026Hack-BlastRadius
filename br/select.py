@@ -99,6 +99,7 @@ class Ctx:
             self.fixcost[EXECUTOR] = min(self.fixcost[EXECUTOR], 0.4)
         self.slice_ok = True
         self.last = ([], {})
+        self.probes = []
         self.verifier = None
         self.mirror = None
         self.cpu_spent = 0.0
@@ -206,7 +207,9 @@ def _ref_users(ctx, path, old_text, old_lines):
                 hit.update(ln for ln in old_lines if lo <= ln <= hi)
         if not names or hit != set(old_lines):
             return None
-        out = set()
+        out = set()   # tests that run a mention inside a function
+        top = set()   # tests that run a mention at import time (class/module level, one-line lambdas)
+        same = False  # the changed file itself reads the name at import time
         files, refs = _refs()
         recorded = {}
         for n in names:
@@ -219,8 +222,12 @@ def _ref_users(ctx, path, old_text, old_lines):
                     rec = recorded[f] = maps.lines(f) if maps.known_file(f) else set()
                 for k in range(first, last + 1):
                     if k in rec:
-                        out |= maps.tests_for(f, k, "any")
-        return ctx.tr(out)
+                        out |= maps.tests_for(f, k, "fn")
+                        t = maps.tests_for(f, k, "top")
+                        top |= t
+                        if t and f == path:
+                            same = True
+        return ctx.tr(out), ctx.tr(top), same
     except Exception:
         return None
 
@@ -234,6 +241,7 @@ def analyze(ctx, text):
     if not fps:
         raise Full("empty patch")
     cand = set(ctx.unmapped)
+    probes = []    # changed modules whose import must be checked because candidates were narrowed
     impacts = []   # (path, old lines, "fn") for function-body changes; (path, [], None) = cannot be sliced
     data = {}      # changed non-Python file -> (old text, new text), or None when it cannot be sliced
     py_impact = bool(ctx.unmapped)
@@ -295,24 +303,36 @@ def analyze(ctx, text):
                 if k == "noop":
                     notes.append(f"{p}: noop")
                 elif k == "lines":
-                    kind = "fn" if imp.level == "fn" else "any"
+                    level = imp.level
+                    if level == "fn":
+                        # Line events are not reported for code that sits on its definition line (one-line
+                        # lambdas and defs). Such a line only shows import-time hits; treat it as import-level.
+                        fn_hits = any(maps.tests_for(old_p, ln, "fn") for ln in imp.old_lines)
+                        top_hits = any(maps.tests_for(old_p, ln, "top") for ln in imp.old_lines)
+                        if not fn_hits and top_hits:
+                            level = "top"
+                    kind = "fn" if level == "fn" else "any"
+                    anyc = set()
+                    for ln in imp.old_lines:
+                        anyc |= ctx.tr(maps.tests_for(old_p, ln, kind))
                     narrowed = None
-                    if imp.level == "top" and CLASS_NARROW:
+                    if level == "top" and CLASS_NARROW:
                         narrowed = _class_users(ctx, old_p, imp.old_lines)
-                    if narrowed is not None:
-                        cc = set(narrowed)
-                    else:
-                        cc = set()
-                        for ln in imp.old_lines:
-                            cc |= ctx.tr(maps.tests_for(old_p, ln, kind))
+                    cc = set(narrowed) if narrowed is not None else set(anyc)
                     refs = None
-                    if imp.level == "top" and REF_NARROW and cc:
+                    if level == "top" and REF_NARROW and cc:
                         refs = _ref_users(ctx, old_p, old_text, imp.old_lines)
                         if refs is not None:
-                            cc &= refs
+                            # only tests that run code mentioning the name; but if this file itself reads the
+                            # name at import time (default arguments, later class-level code), every importer
+                            cc = cc & (refs[0] | refs[1])
+                            if refs[2]:
+                                cc |= anyc
+                    if level == "top" and (narrowed is not None or refs is not None):
+                        probes.append(old_p)   # narrowing assumes the module still imports: check that
                     c |= cc
-                    impacts.append((old_p, sorted(imp.old_lines), "fn") if imp.level == "fn" else (old_p, [], None))
-                    notes.append(f"{p}: lines/{imp.level}{'/cls' if narrowed is not None else ''}"
+                    impacts.append((old_p, sorted(imp.old_lines), "fn") if level == "fn" else (old_p, [], None))
+                    notes.append(f"{p}: lines/{level}{'/cls' if narrowed is not None else ''}"
                                  f"{'/ref' if refs is not None else ''} {sorted(imp.old_lines)[:6]} -> {len(cc)}")
                 elif k == "syntax_error":
                     c |= ctx.tr(maps.tests_for_file(old_p, "any"))
@@ -329,6 +349,7 @@ def analyze(ctx, text):
             py_impact = True
         cand |= c
     ctx.last = (impacts, data)
+    ctx.probes = probes
     return cand, certain, changes, notes, py_impact
 
 
@@ -470,6 +491,48 @@ def _slice_plan(ctx, n, impacts, data):
         return 1.0, None
 
 
+def _probe_fn(path):
+    """Stand-in 'test': does the patched module still import?"""
+    mod = path[:-3].replace("/", ".")
+    if mod.endswith(".__init__"):
+        mod = mod[:-9]
+
+    def f():
+        import importlib
+        try:
+            importlib.import_module(mod)
+            return "pass"
+        except BaseException:  # noqa: BLE001
+            return "fail"
+    return f
+
+
+def _importers(ctx, paths):
+    out = set()
+    for p in paths:
+        out |= ctx.tr(maps.tests_for_file(p, "any"))
+    return out
+
+
+def _probe_only(ctx, changes, deadline):
+    """Candidates were narrowed below 'every importer' for these modules; that is only valid if the
+    module still imports. Returns the tests to add (every importer of a module that no longer imports)."""
+    probes = ctx.probes
+    if not probes or not VERIFY:
+        return _importers(ctx, probes) if probes else set()
+    ver, mir = _engine(ctx)
+    ids = ["probe::" + p for p in probes]
+    try:
+        mir.apply(changes)
+        changed = None if any(p.startswith("tests/") for p in changes) else list(changes)
+        res = ver.verify(ids, stop_on_fail=False, wall_s=max(1.0, min(20.0, deadline - time.time() - 3)),
+                         changed=changed, specials={i: _probe_fn(p) for i, p in zip(ids, probes)})
+    finally:
+        mir.restore()
+    ctx.cpu_spent += res.cpu_s
+    return _importers(ctx, [p for i, p in zip(ids, probes) if res.results.get(i) != "pass"])
+
+
 def _gm_dialects(impacts, data):
     """Dialects whose own code contains a changed line; None = all dialects."""
     if data:
@@ -527,15 +590,16 @@ def decide(ctx, commit, text, deadline):
     impacts, data = ctx.last
     info = {"cand": len(cand), "notes": notes, "verified": 0, "cpu": 0.0, "how": ""}
     if not cand:
-        info["how"] = "no candidates"
-        return set(), info
+        wide = _probe_only(ctx, changes, deadline)
+        info["how"] = "no candidates" if not wide else "module no longer imports"
+        return wide, info
     if certain:
         info["how"] = "certain"
         return cand, info
     if DATA_STATIC and not py_impact:
         # A changed fixture almost always breaks the test that reads it; running it first only costs CPU.
         info["how"] = "data file change, static"
-        return cand, info
+        return cand | _probe_only(ctx, changes, deadline), info
     static_cost = _cost(ctx, cand)
 
     # Per-test plan and estimated CPU to verify it.
@@ -595,7 +659,7 @@ def decide(ctx, commit, text, deadline):
     if (not VERIFY or not V or e > MAX_VERIFY_CPU or e > VERIFY_FACTOR * gain
             or time.time() + e * 2 + 5 > deadline):
         info["how"] = f"static (est {e:.1f}s vs gain {gain:.1f}s of {static_cost:.1f}s)"
-        return cand, info
+        return cand | _probe_only(ctx, changes, deadline), info
 
     # Each sliced test gets its own fixture filter, switched on right before it runs. TestExecutor builds
     # its query lists once in setUpClass, so that class gets one filter: the union over its sliced tests.
@@ -682,17 +746,23 @@ def decide(ctx, commit, text, deadline):
         mir.apply(changes)
         # Warm modules stay valid only if the patch touches no module already imported and nothing under tests/.
         changed = None if any(p.startswith("tests/") for p in changes) else list(changes)
-        res = ver.verify(ids, stop_on_fail=True, timeouts=timeouts, wall_s=wall, changed=changed,
+        res = ver.verify(ids + ["probe::" + p for p in ctx.probes], stop_on_fail=True, timeouts=timeouts,
+                         wall_s=wall, changed=changed,
                          prepare=prepare, always=always,
-                         specials={t: f for t, f in specials.items() if ctx.num[t] in V})
+                         specials={**{t: f for t, f in specials.items() if ctx.num[t] in V},
+                                   **{"probe::" + p: _probe_fn(p) for p in ctx.probes}})
     finally:
         mir.restore()
     ctx.cpu_spent += res.cpu_s
     info["cpu"] = res.cpu_s
     info["verified"] = len(res.results)
+    broken = [p for p in ctx.probes if res.results.pop("probe::" + p, None) != "pass"]
     passed = {ctx.num[i] for i, o in res.results.items() if o == "pass"}
     failed = {ctx.num[i] for i, o in res.results.items() if o != "pass"}
     pending = set(order) - passed - failed  # not run, or in progress when the child died
+    if broken:
+        info["how"] = "module no longer imports (or the check did not finish)"
+        return failed | pending | U | sampled | _importers(ctx, broken), info
     if res.died or res.error:
         ctx.log(f"   child problem: died={res.died} timed_out={res.timed_out} error={res.error} suspect={res.suspect}")
     if DEBUG and res.cpu_s > 2:
