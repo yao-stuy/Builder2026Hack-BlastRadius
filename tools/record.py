@@ -60,6 +60,9 @@ def child(root, test, outdir):
     mon.register_callback(tool, mon.events.LINE, on_line)
     mon.set_events(tool, mon.events.LINE)
 
+    import classhook
+    classhook.install(root)
+
     reads = set()
 
     def note(path, isdir=False):
@@ -109,6 +112,7 @@ def child(root, test, outdir):
         "fn": {k: sorted(v) for k, v in fn.items()},
         "top": {k: sorted(v) for k, v in top.items()},
         "reads": sorted(reads),
+        "uses": classhook.used_keys(),
         "mods": [("duckdb" in sys.modules), ("pandas" in sys.modules)],
     }
     tmp = os.path.join(outdir, f"{n}.json.tmp")
@@ -124,6 +128,7 @@ def run_child(root, test, outdir):
         try:
             os.setsid()
             sys.path.insert(0, REPO)
+            sys.path.insert(0, HERE)
             child(root, test, outdir)
         except BaseException as e:  # noqa: BLE001
             sys.stderr.write(f"child {test['number']} error: {e!r}\n")

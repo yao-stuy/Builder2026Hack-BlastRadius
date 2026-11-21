@@ -415,7 +415,7 @@ def cmd_run(a):
     print(f"all done, wall {time.time() - t0:.0f}s", flush=True)
 
 
-def fullcpu_module(root, modname, rows, jobs, outdir):
+def fullcpu_module(root, modname, rows, jobs, outdir, entries=False):
     sys.path.insert(0, REPO)
     rec = Recorder(root)  # not started: children measure plain CPU
     from br import harness, slices
@@ -425,6 +425,18 @@ def fullcpu_module(root, modname, rows, jobs, outdir):
     importlib.import_module(modname)
     tasks = [(d["number"], d["id"], {}, False) for d in rows]
     res = par_run(jobs, tasks, rec, harness, slices)
+    if entries:
+        # unmonitored CPU of: zero-entry run and each single-entry run (monitoring inflates CPU)
+        et = []
+        for d in rows:
+            et.append(((d["number"], None, None), d["id"], {}, True))
+            for fname, ents in d["entries"].items():
+                for i in range(len(ents)):
+                    et.append(((d["number"], fname, i), d["id"], {fname: {i}}, True))
+        er = par_run(jobs, et, rec, harness, slices)
+        for d in rows:
+            d["base_cpu_nm"] = er[(d["number"], None, None)]["cpu"]
+            d["ecpu"] = {f: [er[(d["number"], f, i)]["cpu"] for i in range(len(e))] for f, e in d["entries"].items()}
     for d in rows:
         r = res[d["number"]]
         d["full_cpu"] = r["cpu"]
@@ -435,6 +447,8 @@ def fullcpu_module(root, modname, rows, jobs, outdir):
 
 
 def cmd_fullcpu(a):
+    if not os.path.isdir(os.path.join(a.root, "sqlglot")):
+        shutil.copytree("/src", a.root, ignore=shutil.ignore_patterns(".git", "__pycache__"))
     by_mod = collections.defaultdict(list)
     for p in glob.glob(os.path.join(a.out, "*.json")):
         d = json.load(open(p))
@@ -448,7 +462,7 @@ def cmd_fullcpu(a):
         if pid == 0:
             code = 0
             try:
-                fullcpu_module(a.root, modname, rows, a.jobs, a.out)
+                fullcpu_module(a.root, modname, rows, a.jobs, a.out, a.entries)
             except BaseException:  # noqa: BLE001
                 import traceback
                 traceback.print_exc()
@@ -484,7 +498,7 @@ def cmd_build(a):
         if "notsliceable" in d or not d.get("files"):
             idx["nonsliceable"][n] = d.get("notsliceable", "no fixture files")
             continue
-        blob = {"id": d["id"], "base": _cov_enc(d["base"]), "bcpu": round(d["base_cpu"], 4),
+        blob = {"id": d["id"], "base": _cov_enc(d["base"]), "bcpu": round(d.get("base_cpu_nm", d["base_cpu"]), 4),
                 "fcpu": round(d.get("full_cpu", 0.0), 4), "f": {}}
         for fname, v in d["files"].items():
             if not v["unused"] and not any(e["fn"] or e["top"] for e in d["entries"][fname]):
@@ -492,7 +506,7 @@ def cmd_build(a):
             fe = {"n": v["n"], "l": v["loader"], "p": v["phase"], "u": v["unused"]}
             if not v["unused"]:
                 ents = d["entries"][fname]
-                fe["cpu"] = [e["cpu"] for e in ents]
+                fe["cpu"] = [round(max(0.0, x - d["base_cpu_nm"]), 4) for x in d["ecpu"][fname]] if "ecpu" in d                     else [e["cpu"] for e in ents]
                 for kind in ("fn", "top"):
                     per = {}  # file -> {line: [entries]}
                     for i, e in enumerate(ents):
@@ -545,6 +559,7 @@ def main():
     f.add_argument("--out", default="/scratch/ent")
     f.add_argument("--root", default="/tmp/s")
     f.add_argument("--redo", action="store_true")
+    f.add_argument("--entries", action="store_true", help="also unmonitored per-entry CPU")
     b = sub.add_parser("build")
     b.add_argument("--raw", default="/scratch/ent")
     b.add_argument("--maps", default=os.path.join(REPO, "maps"))

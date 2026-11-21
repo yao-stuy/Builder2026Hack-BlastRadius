@@ -67,9 +67,26 @@ class Ctx:
             self.unreliable = self.tr(maps.isolated_failures())
         except Exception:
             self.unreliable = frozenset()
+        # A class's fixture/start-up cost is paid once per verification run, not once per test.
+        self.cls_of = {t["number"]: t["id"].rsplit("::", 1)[0] for t in tests}
+        self.fix = {}
+        for n, c in self.cls_of.items():
+            v = self.cpu[n]
+            if c not in self.fix or v < self.fix[c]:
+                self.fix[c] = v
         self.verifier = None
         self.mirror = None
         self.cpu_spent = 0.0
+
+    def est(self, nums):
+        """Estimated CPU seconds to run these tests in one child process."""
+        classes = set()
+        tot = 0.25
+        for n in nums:
+            c = self.cls_of[n]
+            classes.add(c)
+            tot += max(0.0005, self.cpu[n] - self.fix[c])
+        return tot + sum(self.fix[c] for c in classes)
 
     def tr(self, s):
         """Translate a set of map test numbers into tests.json numbers."""
@@ -213,7 +230,7 @@ def decide(ctx, commit, text, deadline):
     unrel = (cand - heavy) & ctx.unreliable
     light = cand - heavy - unrel
     static_cost = pack.cost_of_ms(pack.best([(n, ctx.ms[n]) for n in cand]), ctx.ms) / 1000
-    est = sum(ctx.cpu[n] for n in light) + 0.3
+    est = ctx.est(light)
     if (not VERIFY or not light or est > MAX_VERIFY_CPU or est > VERIFY_FACTOR * static_cost
             or time.time() + est * 2 + 5 > deadline):
         info["how"] = f"static (est {est:.1f}s vs {static_cost:.1f}s)"

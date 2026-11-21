@@ -4,6 +4,7 @@ import argparse
 import array
 import json
 import os
+import subprocess
 import sys
 import zlib
 
@@ -65,16 +66,69 @@ def build_blob(lines):
     return b"".join(parts) + bytes(data)
 
 
+def build_classes(out, src, usage):
+    """classes.json.z (class table, families) + uses.bin (descendant-inclusive usage sets)."""
+    p = subprocess.run([sys.executable, os.path.join(HERE, "classtable.py"), src],
+                       capture_output=True, check=True)
+    tab = json.loads(p.stdout)
+    classes = tab["classes"]
+    desc = {}  # key -> set of tests that instantiated key or any class having key in its root-MRO
+    for key, tests_ in usage.items():
+        c = classes.get(key)
+        for k in ([key] + (c["m"] if c else [])):
+            desc.setdefault(k, set()).update(tests_)
+    sets = {(): 0}
+    order = [()]
+    uidx = {}
+    for key in sorted(desc):
+        t = tuple(sorted(desc[key]))
+        i = sets.get(t)
+        if i is None:
+            i = sets[t] = len(order)
+            order.append(t)
+        uidx[key] = i
+    data = bytearray()
+    offs = array.array("I")
+    for t in order:
+        offs.append(len(data))
+        data += enc_set(t)
+    offs.append(len(data))
+    head = array.array("I", [len(order)])
+    parts = []
+    for arr in (head, offs):
+        if sys.byteorder != "little":
+            arr.byteswap()
+        parts.append(arr.tobytes())
+    with open(os.path.join(out, "uses.bin"), "wb") as fh:
+        fh.write(zlib.compress(b"".join(parts) + bytes(data), 9))
+    keys = sorted(classes)
+    kid = {k: i for i, k in enumerate(keys)}
+    files = {}
+    rows = []
+    for k in keys:
+        c = classes[k]
+        rows.append([c["f"], c["s"], c["e"], c["t"], [kid[m] for m in c["m"] if m in kid], uidx.get(k, 0)])
+    fams = [sorted(kid[m] for m in v if m in kid) for v in tab["family"].values()]
+    blob = json.dumps({"keys": keys, "rows": rows, "families": fams}, separators=(",", ":")).encode()
+    with open(os.path.join(out, "classes.json.z"), "wb") as fh:
+        fh.write(zlib.compress(blob, 9))
+    print(f"classes={len(keys)} tracked={sum(c['t'] for c in classes.values())} families={len(fams)} "
+          f"used_classes={len(usage)} import_errors={tab['import_errors']}")
+    print("untracked:", [k for k in keys if not classes[k]["t"]])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rec", default="/scratch/rec")
     ap.add_argument("--out", default=os.path.join(HERE, "..", "maps"))
     ap.add_argument("--tests", default="/kit/sample/tests.json")
+    ap.add_argument("--src", default="/src")
     a = ap.parse_args()
     tests = json.load(open(a.tests))["tests"]
     n = len(tests)
     files = {}   # file -> {line: [fnlist, toplist]}
     reads = {}
+    usage = {}
     outcome = [None] * n
     cpu = [0.0] * n
     mods = [[False, False] for _ in range(n)]
@@ -98,6 +152,8 @@ def main():
                 m = files.setdefault(f, {})
                 for line in ls:
                     m.setdefault(line, ([], []))[ki].append(k)
+        for key in d.get("uses", []):
+            usage.setdefault(key, []).append(k)
         for r in d["reads"]:
             reads.setdefault(r, []).append(k)
     out = os.path.abspath(a.out)
@@ -116,6 +172,7 @@ def main():
     rd = json.dumps({k: v for k, v in sorted(reads.items())}, separators=(",", ":")).encode()
     with open(os.path.join(out, "reads.json.z"), "wb") as fh:
         fh.write(zlib.compress(rd, 9))
+    build_classes(out, a.src, usage)
     failed = [k for k in range(n) if outcome[k] == "fail"]
     meta = {
         "version": 1,
