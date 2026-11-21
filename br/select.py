@@ -27,7 +27,7 @@ TMP = os.environ.get("BR_TMP", "/tmp/br")
 HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", "2500"))          # tests at least this long are never run by us
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"               # dynamic verification on/off
 HEAVY_WHEN_CLEAN = os.environ.get("BR_HEAVY_WHEN_CLEAN", "include")  # include | exclude
-MAX_VERIFY_CPU = float(os.environ.get("BR_MAX_VERIFY_CPU", "12"))     # per-commit cap on estimated verify CPU
+MAX_VERIFY_CPU = float(os.environ.get("BR_MAX_VERIFY_CPU", "15"))     # per-commit cap on estimated verify CPU
 VERIFY_FACTOR = float(os.environ.get("BR_VERIFY_FACTOR", "0.85"))
 # Estimates are in seconds of the scoring machine, which runs about 3x faster than the recording machine.
 EST_SCALE = float(os.environ.get("BR_EST_SCALE", "0.33"))     # verify if est cpu <= factor * static cost
@@ -54,6 +54,7 @@ DUCK1 = os.environ.get("BR_DUCK1", "0") == "1"
 CONTINUE = os.environ.get("BR_CONTINUE", "1") == "1"                  # keep verifying after a failure when it pays
 CONT_FACTOR = float(os.environ.get("BR_CONT_FACTOR", "0.6"))
 REL_CPU = float(os.environ.get("BR_REL_CPU", "3.0"))
+POOL_SPLIT = os.environ.get("BR_POOL_SPLIT", "1") == "1"
 AUDIT = os.environ.get("BR_AUDIT", "0") == "1"                        # test aid: verify everything, report verdicts
 AUDIT_CAP = float(os.environ.get("BR_AUDIT_CAP", "25"))
 ALWAYS = os.environ.get("BR_ALWAYS", "0") == "1"
@@ -737,7 +738,9 @@ def _probe_only(ctx, changes, deadline):
     ids = ["probe::" + p for p in probes]
     try:
         mir.apply(changes)
-        changed = None if any(p.startswith("tests/") for p in changes) else list(changes)
+        # Modules pre-imported in the parent stay valid unless the patch touches one of them (the engine
+        # checks that) or a Python file under tests/ (helpers may be imported under other names).
+        changed = None if any(p.startswith("tests/") and p.endswith(".py") for p in changes) else list(changes)
         res = ver.verify(ids, stop_on_fail=False, wall_s=max(1.0, min(20.0, deadline - time.time() - 3)),
                          changed=changed, specials={i: _probe_fn(p) for i, p in zip(ids, probes)})
     finally:
@@ -909,6 +912,15 @@ def decide(ctx, commit, text, deadline):
             V.discard(n)
             U.add(n)
             best = j
+    # Very large candidate sets: the pool-based optimizer/executor tests cost far more CPU to run than to
+    # emit, while the ordinary tests are cheap to run. Consider verifying only the ordinary ones.
+    pool = {n for n in V if ctx.cls_of[n] in POOL_CLASSES and n not in sampled}
+    if POOL_SPLIT and len(pool) >= 20 and len(V) - len(pool) >= 50:
+        j = est(V - pool) + _cost(ctx, U | pool)
+        if j < best - 1.0:
+            V -= pool
+            U |= pool
+            best = j
     gain = static_cost - _cost(ctx, U)
     e = est(V)
     too_much = (e > AUDIT_CAP) if AUDIT else (e > MAX_VERIFY_CPU or e > VERIFY_FACTOR * gain)
@@ -1016,7 +1028,9 @@ def decide(ctx, commit, text, deadline):
     try:
         mir.apply(changes)
         # Warm modules stay valid only if the patch touches no module already imported and nothing under tests/.
-        changed = None if any(p.startswith("tests/") for p in changes) else list(changes)
+        # Modules pre-imported in the parent stay valid unless the patch touches one of them (the engine
+        # checks that) or a Python file under tests/ (helpers may be imported under other names).
+        changed = None if any(p.startswith("tests/") and p.endswith(".py") for p in changes) else list(changes)
         # Phase 1: everything except the sampled tests; stop at the first failure.
         first = [i for i in ids if ctx.num[i] not in sampled] + ["probe::" + q for q in ctx.probes]
         res = go(first, [i for i in always if ctx.num[i] not in sampled], not AUDIT) if first else None
