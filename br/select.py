@@ -16,7 +16,7 @@ import os
 import re
 import time
 
-from br import classify, diffparse, entrymaps, maps, pack, slices
+from br import adapters, classify, diffparse, entrymaps, maps, pack, slices
 
 ROOT = os.environ.get("BR_SQLGLOT", "/opt/sqlglot")
 MAPS = os.environ.get("BR_MAPS", "/app/maps")
@@ -39,7 +39,11 @@ MAX_TEST_CPU = float(os.environ.get("BR_MAX_TEST_CPU", "4"))           # a singl
 SAMPLE = os.environ.get("BR_SAMPLE", "1") == "1"                      # sample entries of loop tests too expensive to verify
 SAMPLE_CPU = float(os.environ.get("BR_SAMPLE_CPU", "1.5"))
 SAMPLE_MIN = int(os.environ.get("BR_SAMPLE_MIN", "6"))
-NO_RUN = {"tests/test_parser.py::TestParser::test_max_nodes"}
+ADAPT = os.environ.get("BR_ADAPT", "1") == "1"                        # cheap stand-ins for the slowest tests
+MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
+GEN_MEM = "tests/test_generator.py::TestGenerator::test_generator_memory"
+EXECUTOR = "tests/test_executor.py::TestExecutor"
+NO_RUN = set() if ADAPT else {MAX_NODES}
 NEED_3P = ("tests/test_executor.py", "tests/test_optimizer.py")
 
 
@@ -87,6 +91,9 @@ class Ctx:
             v = self.cpu[n]
             if c not in self.fix or v < self.fix[c]:
                 self.fix[c] = v
+        self.fixcost = dict(self.fix)      # what a class fixture costs once per verification run
+        if ADAPT and EXECUTOR in self.fixcost:
+            self.fixcost[EXECUTOR] = min(self.fixcost[EXECUTOR], 0.4)
         self.slice_ok = True
         self.last = ([], {})
         self.verifier = None
@@ -460,6 +467,22 @@ def _slice_plan(ctx, n, impacts, data):
         return 1.0, None
 
 
+def _gm_dialects(impacts, data):
+    """Dialects whose own code contains a changed line; None = all dialects."""
+    if data:
+        return None
+    out = set()
+    for path, lines, kind in impacts:
+        if kind is None:
+            return None
+        for ln in lines:
+            d = adapters.generator_memory_dialects(path, ln, kind)
+            if d is None:
+                return None
+            out.update(d)
+    return sorted(out) if out else None
+
+
 def _sample(ctx, n, sel, full_cost):
     """A loop test whose affected entries are too many to run: pick the cheapest affected entries up to a
     small CPU budget. Their outcome is evidence about the whole test (see decide)."""
@@ -517,11 +540,26 @@ def decide(ctx, commit, text, deadline):
     vcost = {}
     never = set(cand) & ctx.unreliable       # cannot be verified by us
     sampled = set()                          # too expensive to verify fully: only some of their entries are run
+    specials = {}                            # test id -> stand-in callable giving its verdict
     for n in cand:
         if n in never:
             continue
-        if ctx.ids[n] in NO_RUN:
+        tid = ctx.ids[n]
+        if tid in NO_RUN:
             never.add(n)
+            continue
+        if ADAPT and tid == MAX_NODES:
+            # a scaled-down copy of the test body (same structure, ~170x less work)
+            plan[n] = None
+            vcost[n] = 0.5
+            specials[tid] = adapters.max_nodes_proxy
+            continue
+        if ADAPT and tid == GEN_MEM:
+            # the test loops over dialects; run only the dialects whose code the change touches
+            dl = _gm_dialects(impacts, data)
+            plan[n] = None
+            vcost[n] = 2.3 if dl is None else 0.1 + 0.22 * len(dl)
+            specials[tid] = (lambda dl=dl: adapters.generator_memory_run(dl))
             continue
         frac, sel = _slice_plan(ctx, n, impacts, data)
         plan[n] = sel
@@ -537,7 +575,7 @@ def decide(ctx, commit, text, deadline):
                 sampled.add(n)
 
     def est(vs):
-        return 0.05 + sum(vcost[n] for n in vs) + EST_SCALE * sum(ctx.fix[c] for c in {ctx.cls_of[n] for n in vs})
+        return 0.05 + sum(vcost[n] for n in vs) + EST_SCALE * sum(ctx.fixcost[c] for c in {ctx.cls_of[n] for n in vs})
 
     # Leave out of verification the tests that cost more to run than to simply emit.
     V = set(vcost)
@@ -582,17 +620,22 @@ def decide(ctx, commit, text, deadline):
     timeouts = {ctx.ids[n]: max(3.0, 8 * ctx.cpu[n]) for n in order}
     wall = min(max(10.0, e * 6 + 10), max(1.0, deadline - time.time() - 3))
 
+    lazy = ADAPT and any(ctx.cls_of[n] == EXECUTOR for n in V)
+
     def prepare(h):
-        if filt or SLICE:
+        if filt:
             slices.install()
             slices.set_filter(filt)
+        if lazy:
+            adapters.install_executor_lazy()   # load TPC tables only when a test touches them
 
     try:
         mir.apply(changes)
         # Warm modules stay valid only if the patch touches no module already imported and nothing under tests/.
         changed = None if any(p.startswith("tests/") for p in changes) else list(changes)
         res = ver.verify(ids, stop_on_fail=True, timeouts=timeouts, wall_s=wall, changed=changed,
-                         prepare=prepare if (filt and SLICE) else None, always=always)
+                         prepare=prepare if (filt or lazy) else None, always=always,
+                         specials={t: f for t, f in specials.items() if ctx.num[t] in V})
     finally:
         mir.restore()
     ctx.cpu_spent += res.cpu_s

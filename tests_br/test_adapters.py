@@ -37,7 +37,7 @@ class TestAdapters(unittest.TestCase):
             self.assertEqual(dict.__len__(t), 0)  # nothing loaded by len/contains
             r = t["region"]
             self.assertEqual(dict.__len__(t), 1)
-            self.assertEqual(r.columns, te.TPCH_SCHEMA["region"])
+            self.assertEqual(list(r.columns), list(te.TPCH_SCHEMA["region"]))
             t2 = pickle.loads(pickle.dumps(t))
             self.assertEqual(t2["region"].rows, r.rows)
             self.assertEqual(list(t), list(te.TPCH_SCHEMA))  # iteration loads all, original order
