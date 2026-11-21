@@ -54,6 +54,8 @@ DUCK1 = os.environ.get("BR_DUCK1", "0") == "1"
 CONTINUE = os.environ.get("BR_CONTINUE", "1") == "1"                  # keep verifying after a failure when it pays
 CONT_FACTOR = float(os.environ.get("BR_CONT_FACTOR", "0.6"))
 REL_CPU = float(os.environ.get("BR_REL_CPU", "3.0"))
+AUDIT = os.environ.get("BR_AUDIT", "0") == "1"                        # test aid: verify everything, report verdicts
+AUDIT_CAP = float(os.environ.get("BR_AUDIT_CAP", "25"))
 ALWAYS = os.environ.get("BR_ALWAYS", "0") == "1"
 DEBUG = os.environ.get("BR_DEBUG", "0") == "1"
 KEY_NARROW = os.environ.get("BR_KEY_NARROW", "0") == "1"              # table entries keyed by expression class
@@ -823,7 +825,7 @@ def decide(ctx, commit, text, deadline):
     if certain:
         info["how"] = "certain"
         return cand, info
-    if DATA_STATIC and not py_impact and _cost(ctx, cand) <= DATA_STATIC_MAX:
+    if DATA_STATIC and not AUDIT and not py_impact and _cost(ctx, cand) <= DATA_STATIC_MAX:
         # A changed fixture almost always breaks the test that reads it; running it first only costs CPU.
         info["how"] = "data file change, static"
         return cand | _probe_only(ctx, changes, deadline), info
@@ -892,8 +894,8 @@ def decide(ctx, commit, text, deadline):
             best = j
     gain = static_cost - _cost(ctx, U)
     e = est(V)
-    if (not VERIFY or not V or e > MAX_VERIFY_CPU or e > VERIFY_FACTOR * gain
-            or time.time() + e * 4 + 5 > deadline):
+    too_much = (e > AUDIT_CAP) if AUDIT else (e > MAX_VERIFY_CPU or e > VERIFY_FACTOR * gain)
+    if (not VERIFY or not V or too_much or time.time() + e * 4 + 5 > deadline):
         info["how"] = f"static (est {e:.1f}s vs gain {gain:.1f}s of {static_cost:.1f}s)"
         return cand | _probe_only(ctx, changes, deadline), info
 
@@ -1003,7 +1005,7 @@ def decide(ctx, commit, text, deadline):
         changed = None if any(p.startswith("tests/") for p in changes) else list(changes)
         # Phase 1: everything except the sampled tests; stop at the first failure.
         first = [i for i in ids if ctx.num[i] not in sampled] + ["probe::" + q for q in ctx.probes]
-        res = go(first, [i for i in always if ctx.num[i] not in sampled], True) if first else None
+        res = go(first, [i for i in always if ctx.num[i] not in sampled], not AUDIT) if first else None
         if res is not None:
             results.update(res.results)
             cpus.update(res.cpus)
@@ -1081,6 +1083,10 @@ def decide(ctx, commit, text, deadline):
         top = sorted(cpus.items(), key=lambda kv: -kv[1])[:8]
         ctx.log("   cpu by test: " + ", ".join(f"{t.split('::')[-1]}={c:.2f}(est {vcost.get(ctx.num.get(t), 0):.2f})" for t, c in top)
                 + f" | sum {sum(cpus.values()):.1f} of {cpu:.1f}")
+    if AUDIT:
+        # test aid: report every verdict so a script can compare them with the real outcomes
+        ctx.log("AUDIT " + commit + " P " + ",".join(map(str, sorted(passed - sampled))) + " F "
+                + ",".join(map(str, sorted(failed))) + " S " + ",".join(map(str, sorted(sampled & passed))))
     nsl = sum(1 for n in V if plan[n] is not None)
     # A sampled test is dropped only when its sample passed and no failed or unverified test is closely
     # related to it (same test class, or driven by the same fixture file).
