@@ -14,6 +14,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import sys
 import time
 
 from br import adapters, classify, diffparse, entrymaps, maps, pack, slices
@@ -44,6 +45,7 @@ MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
 GEN_MEM = "tests/test_generator.py::TestGenerator::test_generator_memory"
 EXECUTOR = "tests/test_executor.py::TestExecutor"
 NO_RUN = set() if ADAPT else {MAX_NODES}
+DUCK1 = os.environ.get("BR_DUCK1", "0") == "1"
 DEBUG = os.environ.get("BR_DEBUG", "0") == "1"
 NEED_3P = ("tests/test_executor.py", "tests/test_optimizer.py")
 
@@ -631,6 +633,20 @@ def decide(ctx, commit, text, deadline):
     lazy = ADAPT and any(ctx.cls_of[n] == EXECUTOR for n in V)
 
     def prepare(h):
+        if DUCK1 and "duckdb" in sys.modules:
+            # CPU time counts every thread; one DuckDB thread does the same work with less overhead.
+            duckdb = sys.modules["duckdb"]
+            real_connect = duckdb.connect
+
+            def connect(*a, **k):
+                con = real_connect(*a, **k)
+                try:
+                    con.execute("SET threads=1")
+                except Exception:
+                    pass
+                return con
+
+            duckdb.connect = connect
         if filt:
             import unittest
             slices.install()
@@ -667,7 +683,7 @@ def decide(ctx, commit, text, deadline):
         # Warm modules stay valid only if the patch touches no module already imported and nothing under tests/.
         changed = None if any(p.startswith("tests/") for p in changes) else list(changes)
         res = ver.verify(ids, stop_on_fail=True, timeouts=timeouts, wall_s=wall, changed=changed,
-                         prepare=prepare if (filt or lazy) else None, always=always,
+                         prepare=prepare, always=always,
                          specials={t: f for t, f in specials.items() if ctx.num[t] in V})
     finally:
         mir.restore()
