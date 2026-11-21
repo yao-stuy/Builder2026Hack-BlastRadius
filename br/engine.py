@@ -114,16 +114,17 @@ class Verifier:
 
     # ------------------------------------------------------------------
     def verify(self, test_ids, *, stop_on_fail=True, timeouts=None, wall_s=60.0, changed=None,
-               prepare=None, specials=None):
+               prepare=None, specials=None, always=()):
         """prepare(harness): called in the child after harness.setup, before any test runs.
         specials: {test_id: callable -> "pass" | "fail" | None}; those ids are not run as tests,
         the callable decides their outcome (None = no verdict). Specials run after the normal
-        tests and are not skipped by stop_on_fail."""
+        tests and are not skipped by stop_on_fail.
+        always: ids that run first and never stop the run (their verdict is wanted regardless)."""
         test_ids = list(test_ids)
         res = VerifyResult()
         t0 = time.monotonic()
         try:
-            self._verify(test_ids, stop_on_fail, timeouts, wall_s, res, changed, prepare, specials or {})
+            self._verify(test_ids, stop_on_fail, timeouts, wall_s, res, changed, prepare, specials or {}, set(always))
         except BaseException as e:  # noqa: BLE001
             if isinstance(e, KeyboardInterrupt):
                 raise
@@ -135,7 +136,7 @@ class Verifier:
             res.suspect = res.not_run[0]
         return res
 
-    def _verify(self, test_ids, stop_on_fail, timeouts, wall_s, res, changed, prepare=None, specials=None):
+    def _verify(self, test_ids, stop_on_fail, timeouts, wall_s, res, changed, prepare=None, specials=None, always=()):
         if not test_ids:
             return
         rfd, wfd = os.pipe()
@@ -146,7 +147,7 @@ class Verifier:
             os.close(wfd)
             raise
         if pid == 0:
-            self._child(rfd, wfd, test_ids, stop_on_fail, timeouts, changed, prepare, specials or {})  # never returns
+            self._child(rfd, wfd, test_ids, stop_on_fail, timeouts, changed, prepare, specials or {}, always)  # never returns
         os.close(wfd)
         started = None
         buf = b""
@@ -216,7 +217,7 @@ class Verifier:
             res.suspect = started
 
     # ------------------------------------------------------------------
-    def _child(self, rfd, wfd, test_ids, stop_on_fail, timeouts, changed, prepare=None, specials=None):
+    def _child(self, rfd, wfd, test_ids, stop_on_fail, timeouts, changed, prepare=None, specials=None, always=()):
         code = 1
         try:
             os.setsid()
@@ -258,7 +259,12 @@ class Verifier:
             else:
                 d = dict(timeouts)
                 tmo = lambda tid: d.get(tid)  # noqa: E731
-            for grp in _groups([t for t in test_ids if t not in specials]):
+            first = [t for t in test_ids if t in always and t not in specials]
+            for grp in _groups(first):
+                for tid, o, _cpu in h.run(grp, stop_on_fail=False, timeout_s=tmo):
+                    if o != "notrun":
+                        emit({"r": tid, "o": o})
+            for grp in _groups([t for t in test_ids if t not in specials and t not in always]):
                 out = h.run(grp, stop_on_fail=stop_on_fail, timeout_s=tmo)
                 stop = False
                 for tid, o, _cpu in out:

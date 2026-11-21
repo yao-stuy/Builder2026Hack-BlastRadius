@@ -16,7 +16,7 @@ import os
 import re
 import time
 
-from br import classify, diffparse, maps, pack
+from br import classify, diffparse, entrymaps, maps, pack, slices
 
 ROOT = os.environ.get("BR_SQLGLOT", "/opt/sqlglot")
 MAPS = os.environ.get("BR_MAPS", "/app/maps")
@@ -26,7 +26,7 @@ TMP = os.environ.get("BR_TMP", "/tmp/br")
 HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", "2500"))          # tests at least this long are never run by us
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"               # dynamic verification on/off
 HEAVY_WHEN_CLEAN = os.environ.get("BR_HEAVY_WHEN_CLEAN", "include")  # include | exclude
-MAX_VERIFY_CPU = float(os.environ.get("BR_MAX_VERIFY_CPU", "8"))     # per-commit cap on estimated verify CPU
+MAX_VERIFY_CPU = float(os.environ.get("BR_MAX_VERIFY_CPU", "20"))     # per-commit cap on estimated verify CPU
 VERIFY_FACTOR = float(os.environ.get("BR_VERIFY_FACTOR", "0.8"))
 EST_SCALE = float(os.environ.get("BR_EST_SCALE", "0.5"))     # verify if est cpu <= factor * static cost
 DATA_STATIC = os.environ.get("BR_DATA_STATIC", "1") == "1"            # data-only patches: emit readers without verifying
@@ -34,6 +34,12 @@ WARM = os.environ.get("BR_WARM", "1") == "1"                          # pre-impo
 CLASS_NARROW = os.environ.get("BR_CLASS_NARROW", "1") == "1"          # class-body changes: only tests using the class
 CLASS_SPAN_MAX = int(os.environ.get("BR_CLASS_SPAN_MAX", "1500"))
 REF_NARROW = os.environ.get("BR_REF_NARROW", "1") == "1"              # constant assignments: only tests running code that mentions the name
+SLICE = os.environ.get("BR_SLICE", "1") == "1"                        # run only the affected fixture entries of loop tests
+MAX_TEST_CPU = float(os.environ.get("BR_MAX_TEST_CPU", "4"))           # a single test costing more than this is not run by us
+SAMPLE = os.environ.get("BR_SAMPLE", "1") == "1"                      # sample entries of loop tests too expensive to verify
+SAMPLE_CPU = float(os.environ.get("BR_SAMPLE_CPU", "1.5"))
+SAMPLE_MIN = int(os.environ.get("BR_SAMPLE_MIN", "6"))
+NO_RUN = {"tests/test_parser.py::TestParser::test_max_nodes"}
 NEED_3P = ("tests/test_executor.py", "tests/test_optimizer.py")
 
 
@@ -81,6 +87,8 @@ class Ctx:
             v = self.cpu[n]
             if c not in self.fix or v < self.fix[c]:
                 self.fix[c] = v
+        self.slice_ok = True
+        self.last = ([], {})
         self.verifier = None
         self.mirror = None
         self.cpu_spent = 0.0
@@ -216,6 +224,8 @@ def analyze(ctx, text):
     if not fps:
         raise Full("empty patch")
     cand = set(ctx.unmapped)
+    impacts = []   # (path, old lines, "fn") for function-body changes; (path, [], None) = cannot be sliced
+    data = {}      # changed non-Python file -> (old text, new text), or None when it cannot be sliced
     py_impact = bool(ctx.unmapped)
     certain = False
     changes = {}
@@ -291,6 +301,7 @@ def analyze(ctx, text):
                         if refs is not None:
                             cc &= refs
                     c |= cc
+                    impacts.append((old_p, sorted(imp.old_lines), "fn") if imp.level == "fn" else (old_p, [], None))
                     notes.append(f"{p}: lines/{imp.level}{'/cls' if narrowed is not None else ''}"
                                  f"{'/ref' if refs is not None else ''} {sorted(imp.old_lines)[:6]} -> {len(cc)}")
                 elif k == "syntax_error":
@@ -299,12 +310,15 @@ def analyze(ctx, text):
                     notes.append(f"{p}: syntax error ({len(c)})")
                 else:  # whole_file or anything unexpected
                     c |= ctx.tr(maps.tests_for_file(old_p, "any"))
+                    impacts.append((old_p, [], None))
                     notes.append(f"{p}: {k} {imp.reason[:40]} ({len(c)})")
         else:
+            data[p] = (old_text, new_text) if fp.status == "modify" and old_text is not None else None
             notes.append(f"{p}: data file ({len(c)})")
         if is_py and c:
             py_impact = True
         cand |= c
+    ctx.last = (impacts, data)
     return cand, certain, changes, notes, py_impact
 
 
@@ -343,7 +357,7 @@ def _cost(ctx, nums):
     return pack.cost_of_ms(pack.best([(n, ctx.ms[n]) for n in nums]), ctx.ms) / 1000
 
 
-def decide(ctx, commit, text, deadline):
+def decide_v1(ctx, commit, text, deadline):
     cand, certain, changes, notes, py_impact = analyze(ctx, text)
     info = {"cand": len(cand), "notes": notes, "verified": 0, "cpu": 0.0, "how": ""}
     if not cand:
@@ -399,8 +413,212 @@ def decide(ctx, commit, text, deadline):
     return sel, info
 
 
+def _slice_plan(ctx, n, impacts, data):
+    """How to run test n for this change: (fraction of the full test's cost, {fixture: entries} or None).
+    None = run the whole test. Loop-style tests run only the fixture entries that execute a changed
+    line (or that are themselves changed); everything else about the test is unchanged."""
+    if not (SLICE and ctx.same and ctx.slice_ok):
+        return 1.0, None
+    try:
+        files = entrymaps.sliceable(n)
+        if not files or all(entrymaps.unused(n, fx) for fx in files):
+            return 1.0, None
+        sel = {fx: set() for fx in files}
+        evidence = False
+        for path, lines, kind in impacts:
+            if kind is None:
+                return 1.0, None
+            for ln in lines:
+                if entrymaps.needs_full(n, path, ln, kind):
+                    return 1.0, None
+                for fx, s in entrymaps.entries(n, path, ln, kind).items():
+                    sel[fx] |= s
+            evidence = True
+        for path, texts in data.items():
+            fx = slices.fixture_arg(path)
+            if fx is None or fx not in sel:
+                # the file is not one this test loops over; if the test reads it some other way, run it whole
+                if n in ctx.tr(maps.tests_reading(path)):
+                    return 1.0, None
+                continue
+            if texts is None:
+                return 1.0, None
+            if entrymaps.unused(n, fx):
+                evidence = True
+                continue
+            ch = slices.changed_entries(entrymaps.loader(n, fx), texts[0], texts[1])
+            if ch is None:
+                return 1.0, None
+            sel[fx] |= ch
+            evidence = True
+        if not evidence:
+            return 1.0, None
+        full = entrymaps.full_cpu(n)
+        frac = entrymaps.est_cpu(n, sel) / full if full > 0 else 1.0
+        return min(1.0, max(0.02, frac)), sel
+    except Exception:
+        return 1.0, None
+
+
+def _sample(ctx, n, sel, full_cost):
+    """A loop test whose affected entries are too many to run: pick the cheapest affected entries up to a
+    small CPU budget. Their outcome is evidence about the whole test (see decide)."""
+    try:
+        files = entrymaps.sliceable(n)
+        if not files:
+            return None
+        full = entrymaps.full_cpu(n)
+        if full <= 0:
+            return None
+        cpus = entrymaps.entry_cpu(n)
+        pool = []
+        for fx, cnt in files.items():
+            if entrymaps.unused(n, fx):
+                continue
+            want = sel.get(fx) if sel is not None else None
+            w = cpus.get(fx) or [1.0] * cnt
+            for i in (sorted(want) if want else range(cnt)):
+                pool.append((w[i] if i < len(w) else 1.0, fx, i))
+        if not pool:
+            return None
+        pool.sort()
+        out = {fx: set() for fx in files}
+        cost = 0.0
+        k = 0
+        for _, fx, i in pool:
+            out[fx].add(i)
+            k += 1
+            cost = full_cost * min(1.0, entrymaps.est_cpu(n, out) / full)
+            if k >= SAMPLE_MIN and cost >= SAMPLE_CPU:
+                break
+        return out, cost
+    except Exception:
+        return None
+
+
+def decide(ctx, commit, text, deadline):
+    cand, certain, changes, notes, py_impact = analyze(ctx, text)
+    impacts, data = ctx.last
+    info = {"cand": len(cand), "notes": notes, "verified": 0, "cpu": 0.0, "how": ""}
+    if not cand:
+        info["how"] = "no candidates"
+        return set(), info
+    if certain:
+        info["how"] = "certain"
+        return cand, info
+    if DATA_STATIC and not py_impact:
+        # A changed fixture almost always breaks the test that reads it; running it first only costs CPU.
+        info["how"] = "data file change, static"
+        return cand, info
+    static_cost = _cost(ctx, cand)
+
+    # Per-test plan and estimated CPU to verify it.
+    plan = {}
+    vcost = {}
+    never = set(cand) & ctx.unreliable       # cannot be verified by us
+    sampled = set()                          # too expensive to verify fully: only some of their entries are run
+    for n in cand:
+        if n in never:
+            continue
+        if ctx.ids[n] in NO_RUN:
+            never.add(n)
+            continue
+        frac, sel = _slice_plan(ctx, n, impacts, data)
+        plan[n] = sel
+        full_cost = max(0.0005, ctx.cpu[n] - ctx.fix[ctx.cls_of[n]]) * EST_SCALE
+        vcost[n] = full_cost * frac
+        if vcost[n] > MAX_TEST_CPU:
+            smp = _sample(ctx, n, sel, full_cost) if SAMPLE else None
+            if smp is None:
+                never.add(n)
+                del vcost[n]
+            else:
+                plan[n], vcost[n] = smp
+                sampled.add(n)
+
+    def est(vs):
+        return 0.05 + sum(vcost[n] for n in vs) + EST_SCALE * sum(ctx.fix[c] for c in {ctx.cls_of[n] for n in vs})
+
+    # Leave out of verification the tests that cost more to run than to simply emit.
+    V = set(vcost)
+    U = set(never)
+    best = est(V) + _cost(ctx, U)
+    for n in sorted(V - sampled, key=lambda n: -vcost[n])[:10]:
+        j = est(V - {n}) + _cost(ctx, U | {n})
+        if j < best - 1e-9:
+            V.discard(n)
+            U.add(n)
+            best = j
+    gain = static_cost - _cost(ctx, U)
+    e = est(V)
+    if (not VERIFY or not V or e > MAX_VERIFY_CPU or e > VERIFY_FACTOR * gain
+            or time.time() + e * 2 + 5 > deadline):
+        info["how"] = f"static (est {e:.1f}s vs gain {gain:.1f}s of {static_cost:.1f}s)"
+        return cand, info
+
+    # Fixture filters for sliced tests; a file some test needs whole stays unfiltered.
+    filt = {}
+    whole = set()
+    for n in V:
+        sel = plan[n]
+        if sel is None:
+            fl = entrymaps.sliceable(n) if (SLICE and ctx.same and ctx.slice_ok) else None
+            for fx in (fl or ()):
+                if not entrymaps.unused(n, fx):
+                    whole.add(fx)
+        else:
+            for fx, s in sel.items():
+                filt.setdefault(fx, set()).update(s)
+    for fx in whole:
+        filt.pop(fx, None)
+
+    ver, mir = _engine(ctx)
+    order = _order(ctx, V, changes)
+    ids = [ctx.ids[n] for n in order]
+    # Tests that are expensive to emit but cheap to check run first, and a failure elsewhere never skips them.
+    always = [ctx.ids[n] for n in order if n in sampled or (ctx.ms[n] >= 1000 and vcost[n] < 0.7 * ctx.ms[n] / 1000)]
+    if any(ctx.file_of[n] in NEED_3P for n in order):
+        ver.ensure_preloaded(("duckdb", "pandas", "numpy"))
+    timeouts = {ctx.ids[n]: max(3.0, 8 * ctx.cpu[n]) for n in order}
+    wall = min(max(10.0, e * 6 + 10), max(1.0, deadline - time.time() - 3))
+
+    def prepare(h):
+        if filt or SLICE:
+            slices.install()
+            slices.set_filter(filt)
+
+    try:
+        mir.apply(changes)
+        # Warm modules stay valid only if the patch touches no module already imported and nothing under tests/.
+        changed = None if any(p.startswith("tests/") for p in changes) else list(changes)
+        res = ver.verify(ids, stop_on_fail=True, timeouts=timeouts, wall_s=wall, changed=changed,
+                         prepare=prepare if (filt and SLICE) else None, always=always)
+    finally:
+        mir.restore()
+    ctx.cpu_spent += res.cpu_s
+    info["cpu"] = res.cpu_s
+    info["verified"] = len(res.results)
+    passed = {ctx.num[i] for i, o in res.results.items() if o == "pass"}
+    failed = {ctx.num[i] for i, o in res.results.items() if o != "pass"}
+    pending = set(order) - passed - failed  # not run, or in progress when the child died
+    nsl = sum(1 for n in V if plan[n] is not None)
+    if failed or pending:
+        # A sampled test that passed its sample is still emitted when something else failed.
+        info["how"] = (f"fail found ({len(failed)} failed, {len(pending)} unverified, {len(U)} not run, "
+                       f"{nsl} sliced, {len(sampled)} sampled, est {e:.1f}s)")
+        return failed | pending | U | sampled, info
+    info["how"] = f"clean ({len(passed)} passed, {len(U)} not run, {nsl} sliced, {len(sampled)} sampled, est {e:.1f}s)"
+    return set(U), info
+
+
 def run(data_dir, tests, commits, deadline, log):
     ctx = Ctx(tests, log)
+    if SLICE:
+        try:
+            entrymaps.load(MAPS)
+        except Exception as e:  # noqa: BLE001
+            log("entry maps unavailable:", repr(e))
+            ctx.slice_ok = False
     full = None
     answers = {}
     for c in commits:
