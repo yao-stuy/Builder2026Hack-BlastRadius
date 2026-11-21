@@ -42,6 +42,9 @@ MAX_TEST_CPU = float(os.environ.get("BR_MAX_TEST_CPU", "1.5"))           # a sin
 SAMPLE = os.environ.get("BR_SAMPLE", "1") == "1"                      # sample entries of loop tests too expensive to verify
 SAMPLE_CPU = float(os.environ.get("BR_SAMPLE_CPU", "0.3"))
 SAMPLE_TRUST = os.environ.get("BR_SAMPLE_TRUST", "1") == "1"          # drop a sampled test whenever its sample passes
+SLICE_CAP = float(os.environ.get("BR_SLICE_CAP", "18"))               # most CPU spent on one exact slice
+SLICE_SHARE = float(os.environ.get("BR_SLICE_SHARE", "0.75"))          # ... as a share of the cost of emitting the test
+SAMPLE_MIN_MS = int(os.environ.get("BR_SAMPLE_MIN_MS", "10000"))       # only tests this slow are ever sampled
 SAMPLE_MIN = int(os.environ.get("BR_SAMPLE_MIN", "3"))
 ADAPT = os.environ.get("BR_ADAPT", "1") == "1"                        # cheap stand-ins for the slowest tests
 MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
@@ -121,6 +124,7 @@ class Ctx:
             self.fixcost[EXECUTOR] = min(self.fixcost[EXECUTOR], 0.4)
         self.n_exec = sum(1 for c in self.cls_of.values() if c == EXECUTOR)
         self.slice_ok = True
+        self.import_readers = set()
         self.last = ([], {})
         self.probes = []
         self.verifier = None
@@ -234,6 +238,7 @@ def _ref_users(ctx, path, old_text, old_lines):
         out = set()   # tests that run a mention inside a function
         top = set()   # tests that run a mention at import time (class/module level, one-line lambdas)
         same = False  # the changed file itself reads the name at import time
+        readers = set()
         files, refs = _refs()
         recorded = {}
         for n in names:
@@ -251,6 +256,9 @@ def _ref_users(ctx, path, old_text, old_lines):
                         top |= t
                         if t and f == path:
                             same = True
+                        if t and f != path and f.startswith("sqlglot/"):
+                            readers.add(f)      # another module consumes the name while it is imported
+        ctx.import_readers = readers
         return ctx.tr(out), ctx.tr(top), same
     except Exception:
         return None
@@ -427,7 +435,81 @@ def _only_unused_additions(path, old_text, new_text):
             for n in names:
                 if n in used or n.startswith("__") or hasattr(builtins, n):
                     return False
+                # Modules are star-imported into packages (sqlglot.expressions), so a new public name can
+                # replace a name defined elsewhere: it must not occur anywhere in the tree.
+                if n in _tree_words():
+                    return False
         return True
+    except Exception:
+        return False
+
+
+_WORDS = None
+
+
+def _tree_words():
+    """Every identifier-like word in the Python sources of the pinned tree."""
+    global _WORDS
+    if _WORDS is None:
+        words = set()
+        pat = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+        for top in ("sqlglot", "tests"):
+            for d, _, files in os.walk(os.path.join(ROOT, top)):
+                for f in files:
+                    if f.endswith(".py"):
+                        try:
+                            with open(os.path.join(d, f), encoding="utf-8") as fh:
+                                words.update(pat.findall(fh.read()))
+                        except Exception:
+                            pass
+        _WORDS = words
+    return _WORDS
+
+
+def _bindings(tree):
+    """Qualified names bound at module and class level (functions, classes, assignments, imports)."""
+    out = set()
+    todo = [("", tree)]
+    while todo:
+        prefix, node = todo.pop()
+        for st in getattr(node, "body", []):
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out.add(prefix + st.name)
+            elif isinstance(st, ast.ClassDef):
+                out.add(prefix + st.name)
+                todo.append((prefix + st.name + ".", st))
+            elif isinstance(st, ast.Assign):
+                for t in st.targets:
+                    for n in ast.walk(t):
+                        if isinstance(n, ast.Name):
+                            out.add(prefix + n.id)
+            elif isinstance(st, (ast.AnnAssign, ast.AugAssign)) and isinstance(st.target, ast.Name):
+                out.add(prefix + st.target.id)
+            elif isinstance(st, (ast.Import, ast.ImportFrom)):
+                for a in st.names:
+                    out.add(prefix + (a.asname or a.name).split(".")[0])
+            elif isinstance(st, (ast.If, ast.Try, ast.With, ast.For, ast.While)):
+                todo.append((prefix, st))
+                for extra in ("orelse", "finalbody"):
+                    sub = getattr(st, extra, None)
+                    if sub:
+                        todo.append((prefix, ast.Module(body=list(sub), type_ignores=[])))
+                for h in getattr(st, "handlers", []) or []:
+                    todo.append((prefix, h))
+    return out
+
+
+_BIND = {}
+
+
+def _same_bindings(path, old_text, new_text):
+    """True when the patch neither adds, removes nor renames a module/class-level name. A renamed or new
+    name can override an inherited one or break importers, which no usage-based narrowing accounts for."""
+    try:
+        old = _BIND.get(path)
+        if old is None:
+            old = _BIND[path] = _bindings(_tree(path, old_text))
+        return old == _bindings(ast.parse(new_text))
     except Exception:
         return False
 
@@ -495,6 +577,12 @@ def analyze(ctx, text):
                 raise Full(f"test-runner configuration changed: {q}")
             if q.endswith(".py") and "/" not in q and fp.status != "modify":
                 raise Full(f"top-level module added or removed: {q}")   # may shadow a library module
+            if q.endswith(".py") and fp.status == "add" and not os.path.isdir(os.path.join(ROOT, q.split("/")[0])):
+                raise Full(f"new top-level package: {q}")
+            if fp.binary and (q.startswith("sqlglot/") or q.startswith("tests/")) and fp.status != "delete":
+                raise Full(f"binary file changed in the source tree: {q}")
+            if q.endswith(".py") and fp.status == "add" and q.startswith("sqlglot/"):
+                probes.append(q)
             if base in ("pyproject.toml", "setup.cfg") and _pytest_section_touched(fp):
                 raise Full(f"pytest settings changed in {q}")
         if fp.binary:
@@ -577,6 +665,8 @@ def analyze(ctx, text):
                         anyc |= ctx.tr(maps.tests_for(old_p, ln, kind))
                     narrowed = None
                     header = None
+                    if level == "top" and not _same_bindings(old_p, old_text, new_text):
+                        level = "top!"      # names changed: every importer is a candidate, no narrowing
                     if level == "top" and HEADER_NARROW:
                         header = _header_users(ctx, old_p, old_text, imp.old_lines)
                     if header is not None:
@@ -586,8 +676,10 @@ def analyze(ctx, text):
                     cc = set(narrowed) if narrowed is not None else set(anyc)
                     refs = None
                     if level == "top" and REF_NARROW and cc and header is None:
+                        ctx.import_readers = set()
                         refs = _ref_users(ctx, old_p, old_text, imp.old_lines)
                         if refs is not None:
+                            probes.extend(sorted(ctx.import_readers))
                             # only tests that run code mentioning the name; but if this file itself reads the
                             # name at import time (default arguments, later class-level code), every importer
                             cc = cc & (refs[0] | refs[1])
@@ -726,6 +818,7 @@ def _probe_fn(path):
     def f():
         import importlib
         try:
+            importlib.import_module("sqlglot")
             importlib.import_module(mod)
             return "pass"
         except BaseException:  # noqa: BLE001
@@ -847,7 +940,9 @@ def _sample(ctx, n, sel, full_cost):
             want = sel.get(fx) if sel is not None else None
             w = cpus.get(fx) or [1.0] * cnt
             for i in (sorted(want) if want else range(cnt)):
-                pool.append((w[i] if i < len(w) else 1.0, fx, i))
+                wi = w[i] if i < len(w) else 1.0
+                # entries with no recorded cost usually do not execute anything: poor evidence, try last
+                pool.append((wi if wi > 0 else 1e9, fx, i))
         if not pool:
             return None
         pool.sort()
@@ -869,10 +964,16 @@ def decide(ctx, commit, text, deadline):
     cand, certain, changes, notes, py_impact = analyze(ctx, text)
     impacts, data = ctx.last
     info = {"cand": len(cand), "notes": notes, "verified": 0, "cpu": 0.0, "how": ""}
+    # Candidates were narrowed for these modules on the assumption that they still import. Check that
+    # first, in a fresh process, before anything else has been imported.
+    wide = _probe_only(ctx, changes, deadline) if ctx.probes else set()
+    ctx.probes = []
+    if wide:
+        info["how"] = "module no longer imports"
+        return cand | wide, info
     if not cand:
-        wide = _probe_only(ctx, changes, deadline)
-        info["how"] = "no candidates" if not wide else "module no longer imports"
-        return wide, info
+        info["how"] = "no candidates"
+        return set(), info
     if certain:
         info["how"] = "certain"
         return cand, info
@@ -919,8 +1020,12 @@ def decide(ctx, commit, text, deadline):
             # ordinary tests cost us a fraction of their recorded seconds on the scoring machine
             full_cost = max(0.0003, ctx.ms[n] / 1000 * REC_SCALE)
         vcost[n] = full_cost * frac
-        if vcost[n] > MAX_TEST_CPU:
-            smp = _sample(ctx, n, sel, full_cost) if SAMPLE else None
+        cap = MAX_TEST_CPU
+        if sel is not None:
+            # an exact slice is worth much more CPU than a sample: allow up to a share of what emitting costs
+            cap = max(cap, min(SLICE_CAP, SLICE_SHARE * (ctx.ms[n] / 1000 + 2)))
+        if vcost[n] > cap:
+            smp = _sample(ctx, n, sel, full_cost) if (SAMPLE and ctx.ms[n] >= SAMPLE_MIN_MS) else None
             if smp is None:
                 never.add(n)
                 del vcost[n]
