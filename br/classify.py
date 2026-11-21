@@ -3,21 +3,44 @@
 ``classify(path, old_text, new_text, fp) -> Impact``; never raises (any internal
 error yields ``kind="whole_file"``).  Conservative by construction: when in doubt
 widen the line set or give up with ``whole_file``.
+
+Performance notes (every CPU second counts at scoring time)
+-----------------------------------------------------------
+* The pristine file's parse tree and index are cached per path (``_OLD``).
+* A *fast path* (``_fast``) never parses/compiles/tokenizes the whole NEW file.  The
+  hunks are grouped into *regions* (consecutive sibling statements of a module or
+  class body, or one whole top-level/class-level function) plus "commentary runs"
+  (only blank/comment-only lines changed).  Everything outside the regions is
+  verified to be textually identical, regions are re-parsed and compiled on their
+  own, and the usual line-mapping logic then runs against a small synthetic "view" of
+  the new tree.  Whenever a precondition of the fast path cannot be established it
+  raises ``_Fallback`` and the original whole-file algorithm (``_classify_full``,
+  kept bit-for-bit equivalent to the old implementation) answers instead.
+* Soundness of the fast path rests on the tokenizer/parser being deterministic and
+  left-to-right: text before a region is identical, a region starts and ends on a
+  statement boundary of the old file, so the new token stream is
+  ``prefix + tokens(new region) + suffix`` and parses/compiles iff the region does
+  (see ``_verify_region`` for the scope-related guards).  The pristine file is assumed
+  to compile (it parses, which we check; a file that parses but fails ``compile`` is
+  not a realistic pristine input).
 """
 
 from __future__ import annotations
 
 import ast
+import copy
 import io
 import re
 import tokenize
 import warnings
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 
 from . import diffparse
 
 _CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
 _DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
+_DEFS_CLS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 _SKIP_TOK = {
     tokenize.COMMENT,
     tokenize.NL,
@@ -27,6 +50,7 @@ _SKIP_TOK = {
     tokenize.ENDMARKER,
     tokenize.ENCODING,
 }
+_SCOPE_GUARD_RE = re.compile(r"\b(?:global|nonlocal|import|__future__)\b")
 
 
 @dataclass
@@ -49,6 +73,10 @@ class _Give(Exception):
     """Cannot classify safely -> whole_file."""
 
 
+class _Fallback(Exception):
+    """Fast path precondition failed -> use the whole-file algorithm."""
+
+
 def _code_lines(text: str) -> set[int]:
     out: set[int] = set()
     try:
@@ -65,7 +93,7 @@ def _code_lines(text: str) -> set[int]:
 
 
 def _start(n: ast.AST) -> int:
-    if isinstance(n, (*_DEFS, ast.ClassDef)):
+    if isinstance(n, _DEFS_CLS):
         return min([n.lineno] + [d.lineno for d in n.decorator_list])
     return n.lineno  # type: ignore[attr-defined]
 
@@ -113,33 +141,70 @@ class _Unit:
     chain: list
 
 
+def _qual_from_chain(chain: list, k: int) -> str:
+    """Qualified name of def/class ``chain[k]`` given its statement ancestors."""
+    prefix = ""
+    for m in chain[:k]:
+        if isinstance(m, _DEFS_CLS):
+            prefix += m.name + (".<locals>." if isinstance(m, _DEFS) else ".")
+    return prefix + chain[k].name  # type: ignore[attr-defined]
+
+
 class _Index:
-    def __init__(self, text: str, tree: ast.Module):
-        self.text = text
-        self.lines = text.split("\n")
+    """Positional index of a module.
+
+    ``code`` is the set of lines carrying tokens (new files); when ``None`` (old files)
+    the "is this a code line" question is only ever asked about lines that lie in the
+    gaps between statements, where a blank/``#`` test on the physical line is exact.
+    """
+
+    def __init__(self, text: str | None, tree: ast.Module, code: set[int] | None = None,
+                 lines: list[str] | None = None):
+        self.lines = lines if lines is not None else text.split("\n")  # type: ignore[union-attr]
         self.tree = tree
-        self.code = _code_lines(text)
+        self.code = code
+        self._gb: dict[int, tuple] = {}
+        self._walked = False
         self.parent: dict[int, ast.AST] = {}
         self.qual: dict[int, str] = {}
-        self.by_qual: dict[str, list[ast.AST]] = {}
-        self.lambdas: dict[str, int] = {}
-        self._walk(tree, tree, "")
+        self.by_qual_: dict[str, list[ast.AST]] = {}
+
+    # -- lazy whole-tree walk (needed only for insertions)
+    def ensure_walk(self) -> None:
+        if not self._walked:
+            self._walked = True
+            self._walk(self.tree, self.tree, "")
+
+    @property
+    def by_qual(self) -> dict[str, list[ast.AST]]:
+        self.ensure_walk()
+        return self.by_qual_
 
     def _walk(self, node: ast.AST, parent: ast.AST, prefix: str) -> None:
-        for group in ([node.body] if isinstance(node, ast.Module) else _child_groups(node)):
+        self._walk_groups(([node.body] if isinstance(node, ast.Module) else _child_groups(node)),
+                          node, prefix)
+
+    def _walk_groups(self, groups, node: ast.AST, prefix: str) -> None:
+        for group in groups:
             for s in group:
                 self.parent[id(s)] = node
                 child_prefix = prefix
-                if isinstance(s, (*_DEFS, ast.ClassDef)):
+                if isinstance(s, _DEFS_CLS):
                     q = prefix + s.name
                     self.qual[id(s)] = q
-                    self.by_qual.setdefault(q, []).append(s)
+                    self.by_qual_.setdefault(q, []).append(s)
                     child_prefix = q + (".<locals>." if isinstance(s, _DEFS) else ".")
                 self._walk(s, node, child_prefix)
 
     # -- positions
     def line_text(self, n: int) -> str:
         return self.lines[n - 1] if 1 <= n <= len(self.lines) else ""
+
+    def is_code(self, L: int) -> bool:
+        if self.code is not None:
+            return L in self.code
+        s = self.line_text(L).strip()
+        return bool(s) and not s.startswith("#")
 
     def _trim_hdr(self, first_line: int, hdr_end: int) -> int:
         while hdr_end > first_line:
@@ -170,24 +235,55 @@ class _Index:
         end = f if f == h.lineno else f - 1
         return range(h.lineno, self._trim_hdr(h.lineno, max(end, h.lineno)) + 1)
 
-    def is_fn_ctx(self, n: ast.AST) -> bool:
-        """Is statement n located inside some function body (strict ancestors)?"""
-        p = self.parent.get(id(n))
-        while p is not None and not isinstance(p, ast.Module):
-            if isinstance(p, _DEFS):
+    # -- unit properties (chain based: no parent map needed)
+    @staticmethod
+    def is_fn_ctx(u: _Unit) -> bool:
+        """Is the unit's statement located inside some function body (strict ancestors)?"""
+        for m in u.chain[:-1]:
+            if isinstance(m, _DEFS):
                 return True
-            p = self.parent.get(id(p))
         return False
 
-    def scope_of(self, n: ast.AST, self_scope: bool) -> str:
-        if self_scope and id(n) in self.qual:
-            return self.qual[id(n)]
-        p = self.parent.get(id(n))
-        while p is not None and not isinstance(p, ast.Module):
-            if id(p) in self.qual:
-                return self.qual[id(p)]
-            p = self.parent.get(id(p))
-        return "<module>"
+    @staticmethod
+    def scope_of(u: _Unit) -> str:
+        chain = u.chain
+        k = len(chain) - 1
+        if not u.self_scope:
+            k -= 1
+        while k >= 0 and not isinstance(chain[k], _DEFS_CLS):
+            k -= 1
+        if k < 0:
+            return "<module>"
+        return _qual_from_chain(chain, k)
+
+    def is_docstring(self, u: _Unit) -> ast.AST | None:
+        n = u.node
+        if u.kind != "stmt" or not isinstance(n, ast.Expr):
+            return None
+        v = n.value
+        if not (isinstance(v, ast.Constant) and isinstance(v.value, str)):
+            return None
+        p = u.chain[-2] if len(u.chain) > 1 else self.tree
+        if isinstance(p, (ast.Module, *_DEFS, ast.ClassDef)) and p.body and p.body[0] is n:
+            return p
+        return None
+
+    # -- sibling lookup
+    def group_bounds(self, g: list) -> tuple[list[int], list[int]]:
+        b = self._gb.get(id(g))
+        if b is None or b[2] is not g:
+            b = ([_start(s) for s in g], [_end(s) for s in g], g)
+            self._gb[id(g)] = b
+        return b[0], b[1]
+
+    def _cover(self, g: list, L: int):
+        starts, ends = self.group_bounds(g)
+        i = bisect_left(starts, L)
+        if i > 0 and L <= ends[i - 1]:  # starts[i-1] < L
+            return g[i - 1]
+        if i < len(g) and starts[i] == L:
+            return g[i]
+        return None
 
     def find_unit(self, L: int) -> _Unit | None:
         groups: list[list[ast.stmt]] = [self.tree.body]
@@ -196,10 +292,7 @@ class _Index:
         while True:
             found = None
             for g in groups:
-                for s in g:
-                    if _start(s) <= L <= _end(s):
-                        found = s
-                        break
+                found = self._cover(g, L)
                 if found is not None:
                     break
             if found is None:
@@ -213,7 +306,7 @@ class _Index:
         if cur is None:
             return None
         hdr = self.hdr_lines(cur)
-        selfscope = isinstance(cur, (*_DEFS, ast.ClassDef))
+        selfscope = isinstance(cur, _DEFS_CLS)
         if L in hdr:
             return _Unit((id(cur), "hdr"), frozenset(hdr), cur, "hdr", selfscope, chain)
         for h in getattr(cur, "handlers", None) or []:
@@ -221,24 +314,43 @@ class _Index:
                 hh = self.handler_hdr(h)
                 if L in hh:
                     return _Unit((id(h), "handler"), frozenset(hh), cur, "handler", False, chain)
-                if L in self.code:
+                if self.is_code(L):
                     return _Unit((id(h), "gap"), frozenset(hh) | {L}, cur, "gap", False, chain)
                 return None
-        if L in self.code:
+        if self.is_code(L):
             return _Unit((id(cur), "gap", L), frozenset(hdr) | {L}, cur, "gap", selfscope, chain)
         return None
 
-    def is_docstring(self, u: _Unit) -> ast.AST | None:
-        n = u.node
-        if u.kind != "stmt" or not isinstance(n, ast.Expr):
-            return None
-        v = n.value
-        if not (isinstance(v, ast.Constant) and isinstance(v.value, str)):
-            return None
-        p = self.parent.get(id(n))
-        if isinstance(p, (ast.Module, *_DEFS, ast.ClassDef)) and p.body and p.body[0] is n:
-            return p
-        return None
+    def multiline_string_at(self, x: int, y: int) -> bool:
+        """Is there a multi-line string literal with start <= y and end >= x touching the
+        statement that (innermost) covers line x?  Used with x == y for a single line and
+        with (b, b + 1) for the boundary between two lines."""
+        for L in {x, y}:
+            u = self._innermost_stmt(L)
+            if u is None:
+                continue
+            nodes = _own_nodes(u) if _is_compound(u) else ast.walk(u)
+            for n in nodes:
+                if isinstance(n, (ast.Constant, ast.JoinedStr)) and (
+                    isinstance(n, ast.JoinedStr) or isinstance(n.value, (str, bytes))
+                ):
+                    if n.end_lineno > n.lineno and n.lineno <= y and n.end_lineno >= x:  # type: ignore[operator]
+                        return True
+        return False
+
+    def _innermost_stmt(self, L: int):
+        groups = [self.tree.body]
+        cur = None
+        while True:
+            found = None
+            for g in groups:
+                found = self._cover(g, L)
+                if found is not None:
+                    break
+            if found is None:
+                return cur
+            cur = found
+            groups = _child_groups(cur)
 
 
 def _is_compound(n: ast.AST) -> bool:
@@ -259,6 +371,44 @@ def _future_set(tree: ast.Module) -> list[str]:
         if isinstance(s, ast.ImportFrom) and s.module == "__future__":
             out.append(ast.dump(s))
     return out
+
+
+# --------------------------------------------------------------------------- old-file cache
+
+
+class _OldInfo:
+    __slots__ = ("text", "tree", "idx")
+
+    def __init__(self, text: str, tree: ast.Module):
+        self.text = text
+        self.tree = tree
+        self.idx = _Index(text, tree)
+
+
+_OLD: dict[str, _OldInfo] = {}
+_OLD_BUDGET = 2_500_000  # chars of cached source (parse trees are ~100x larger)
+
+
+def _clear_cache() -> None:
+    _OLD.clear()
+
+
+def _old_info(path: str, old_text: str) -> _OldInfo:
+    info = _OLD.pop(path, None)
+    if info is not None and (info.text is old_text or info.text == old_text):
+        _OLD[path] = info  # most recently used goes last
+        return info
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        tree = ast.parse(old_text)
+    info = _OldInfo(old_text, tree)
+    _OLD[path] = info
+    total = 0
+    for k in reversed(list(_OLD)):
+        total += len(_OLD[k].text)
+        if total > _OLD_BUDGET and k != path:
+            del _OLD[k]
+    return info
 
 
 # --------------------------------------------------------------------------- runs
@@ -347,6 +497,10 @@ def _structural(fp: diffparse.FilePatch) -> bool:
         return False
 
 
+def _has_lone_cr(text: str) -> bool:
+    return "\r" in text and re.search(r"\r(?!\n)", text) is not None
+
+
 def _classify(path: str, old_text: str, new_text: str, fp: diffparse.FilePatch) -> Impact:
     if not path.endswith(".py"):
         return Impact(
@@ -362,9 +516,31 @@ def _classify(path: str, old_text: str, new_text: str, fp: diffparse.FilePatch) 
         raise _Give(f"python file {fp.status}")
     if old_text is None or new_text is None:
         raise _Give("missing text")
-    if re.search(r"\r(?!\n)", old_text) or re.search(r"\r(?!\n)", new_text):
+    if _has_lone_cr(old_text) or _has_lone_cr(new_text):
         raise _Give("lone CR line endings")
 
+    runs = _runs(fp)
+    ipts = diffparse.insert_points(fp)
+    added_text = "\n".join(t.strip() for r in runs for _, t in r.added)
+    shift = any(len(r.removed) != len(r.added) for r in runs)
+
+    try:
+        res = _fast(path, old_text, new_text, fp, runs, ipts, added_text, shift)
+    except _Fallback:
+        res = None
+    except _Give:
+        raise
+    except Exception:  # noqa: BLE001 - anything unexpected: use the exact algorithm
+        res = None
+    if res is not None:
+        return res
+    return _classify_full(path, old_text, new_text, fp, runs, ipts, added_text, shift)
+
+
+# ---- the exact whole-file algorithm
+
+
+def _classify_full(path, old_text, new_text, fp, runs, ipts, added_text, shift) -> Impact:
     # new source must compile
     try:
         with warnings.catch_warnings():
@@ -375,13 +551,11 @@ def _classify(path: str, old_text: str, new_text: str, fp: diffparse.FilePatch) 
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            old_tree = ast.parse(old_text)
+            old_info = _old_info(path, old_text)
             new_tree = ast.parse(new_text)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         raise _Give("old file does not parse") from None
-
-    runs = _runs(fp)
-    ipts = diffparse.insert_points(fp)
+    old_tree = old_info.tree
 
     # PEP 263 cookie: first two lines changed or shifted
     o2 = old_text.split("\n", 2)[:2]
@@ -392,9 +566,6 @@ def _classify(path: str, old_text: str, new_text: str, fp: diffparse.FilePatch) 
         for no, t in r.removed + r.added:
             if no <= 2 and _CODING_RE.match(t):
                 raise _Give("encoding declaration touched")
-
-    shift = any(len(r.removed) != len(r.added) for r in runs)
-    added_text = "\n".join(t.strip() for r in runs for _, t in r.added)
 
     if ast.dump(old_tree) == ast.dump(new_tree):
         pos_shift = False
@@ -410,9 +581,16 @@ def _classify(path: str, old_text: str, new_text: str, fp: diffparse.FilePatch) 
     if _future_set(old_tree) != _future_set(new_tree):
         raise _Give("__future__ imports changed")
 
-    old = _Index(old_text, old_tree)
-    new = _Index(new_text, new_tree)
+    old = old_info.idx
+    new = _Index(new_text, new_tree, code=_code_lines(new_text))
+    new.ensure_walk()
+    return _lines_impact(old, new, runs, ipts, added_text, shift)
 
+
+# ---- shared line-mapping logic
+
+
+def _lines_impact(old: _Index, new, runs: list[_Run], ipts, added_text: str, shift: bool) -> Impact:
     lines: set[int] = set()
     scopes: set[str] = set()
     levels: list[str] = []
@@ -423,8 +601,8 @@ def _classify(path: str, old_text: str, new_text: str, fp: diffparse.FilePatch) 
             if isinstance(doc, ast.Module):
                 raise _Give("module docstring changed")
             lines.update(old.hdr_lines(doc))
-        scopes.add(old.scope_of(u.node, u.self_scope))
-        lvl = "fn" if old.is_fn_ctx(u.node) else "top"
+        scopes.add(old.scope_of(u))
+        lvl = "fn" if old.is_fn_ctx(u) else "top"
         narrowed = None
         if lvl == "top" and u.kind in ("stmt", "hdr"):
             for n in _own_nodes(u.node):
@@ -475,7 +653,7 @@ def _classify(path: str, old_text: str, new_text: str, fp: diffparse.FilePatch) 
             assert nu is not None
             containers = []
             for n in reversed(nu.chain):
-                if isinstance(n, (*_DEFS, ast.ClassDef)) and _start(n.body[0]) <= no <= _end(n):
+                if isinstance(n, _DEFS_CLS) and _start(n.body[0]) <= no <= _end(n):
                     containers.append(n)
             if not containers:
                 raise _Give("module-level insertion")
@@ -506,3 +684,386 @@ def _classify(path: str, old_text: str, new_text: str, fp: diffparse.FilePatch) 
     level = "fn" if lv == {"fn"} else "top" if lv == {"top"} else "mixed"
     return Impact("lines", old_lines=lines, scopes=sorted(scopes), level=level,
                   lineno_shift=shift, comment_text=added_text, insert_points=ipts)
+
+
+# --------------------------------------------------------------------------- fast path
+
+
+def _blank_or_comment(t: str) -> bool:
+    s = t.strip()
+    return s == "" or s[0] == "#"
+
+
+@dataclass
+class _Region:
+    chain: list  # enclosing ClassDef nodes (outermost first)
+    group: list  # sibling list the region is a slice of
+    i: int
+    j: int
+    s: int  # old first line
+    e: int  # old last line
+    ns: int = 0  # new first line
+    ne: int = 0  # new last line
+    delta: int = 0
+    runs: list = field(default_factory=list)
+    new_nodes: list = field(default_factory=list)
+
+
+def _touched(r: _Run) -> tuple[int, int]:
+    """Old lines a run touches; an insertion touches the two lines around its boundary."""
+    if r.removed:
+        return r.removed[0][0], r.removed[-1][0]
+    return r.before, r.before + 1
+
+
+def _commentary_ok(old: _Index, r: _Run) -> bool:
+    """Run changes only blank/comment-only physical lines that are outside any string
+    and not adjacent to a backslash continuation: token stream (minus COMMENT/NL) is
+    unchanged."""
+    for _, t in r.removed:
+        if not _blank_or_comment(t):
+            return False
+    for _, t in r.added:
+        if not _blank_or_comment(t):
+            return False
+    n = len(old.lines)
+    if r.removed:
+        lo, hi = r.removed[0][0], r.removed[-1][0]
+        if hi - lo + 1 != len(r.removed):
+            return False
+        prev = lo - 1
+    else:
+        lo, hi = r.before, r.before + 1
+        prev = r.before
+    if prev >= 1 and old.lines[prev - 1].rstrip().endswith("\\"):
+        return False
+    if r.removed:
+        if old.multiline_string_at(lo, hi):
+            return False
+    else:
+        if 1 <= lo and hi <= n and old.multiline_string_at(lo, hi):
+            return False
+    return True
+
+
+def _find_region(old: _Index, lo: int, hi: int) -> _Region:
+    n_old = len(old.lines)
+    if lo < 1 or hi > n_old:
+        raise _Fallback
+    group = old.tree.body
+    chain: list = []
+    while True:
+        starts, ends = old.group_bounds(group)
+        n = len(group)
+        a = bisect_left(ends, lo)  # first sibling ending at/after lo
+        b = bisect_right(starts, hi) - 1  # last sibling starting at/before hi
+        if a <= b:
+            if a == b and starts[a] <= lo and hi <= ends[a]:
+                c = group[a]
+                if isinstance(c, ast.ClassDef) and c.body and lo >= _start(c.body[0]):
+                    chain.append(c)
+                    group = c.body
+                    continue
+            i, j = a, b
+        else:
+            if a - 1 < 0 or a >= n:
+                raise _Fallback
+            i, j = a - 1, a
+        s = min(starts[i], lo)
+        e = max(ends[j], hi)
+        return _Region(chain, group, i, j, s, e)
+
+
+def _ws_of(line: str) -> str:
+    return line[: len(line) - len(line.lstrip(" \t\f"))]
+
+
+def _fast(path, old_text, new_text, fp, runs, ipts, added_text, shift) -> Impact | None:
+    for h in fp.hunks:
+        for ln in h.lines:
+            if ln.no_newline:
+                raise _Fallback
+    if not runs:
+        raise _Fallback
+    info = _old_info(path, old_text)  # parse errors -> generic fallback
+    old = info.idx
+    old_lines = old.lines
+    n_old = len(old_lines)
+    new_lines = new_text.split("\n")
+
+    # PEP 263 cookie: leave the (rare) case to the exact algorithm
+    o2, n2 = old_lines[:2], new_lines[:2]
+    if o2 != n2 and any(_CODING_RE.match(x) for x in o2 + n2):
+        raise _Fallback
+    for r in runs:
+        for no, t in r.removed + r.added:
+            if no <= 2 and _CODING_RE.match(t):
+                raise _Fallback
+
+    # -- classify runs, build regions
+    comm_ids: set[int] = set()
+    regions: list[_Region] = []
+    for r in runs:
+        if _commentary_ok(old, r):
+            comm_ids.add(id(r))
+        else:
+            lo, hi = _touched(r)
+            regions.append(_find_region(old, lo, hi))
+    regions.sort(key=lambda g: (g.s, -g.e))
+    merged: list[_Region] = []
+    for g in regions:
+        if merged:
+            p = merged[-1]
+            if g.s <= p.e:
+                if p.group is g.group and p.chain == g.chain:
+                    p.i, p.j = min(p.i, g.i), max(p.j, g.j)
+                    p.s, p.e = min(p.s, g.s), max(p.e, g.e)
+                    continue
+                if g.e <= p.e:  # nested in the earlier (outer) region
+                    continue
+                raise _Fallback
+        merged.append(g)
+    regions = merged
+    # re-check merged same-group regions that may now overlap the next one
+    for a, b in zip(regions, regions[1:]):
+        if b.s <= a.e:
+            raise _Fallback
+
+    def inside(r: _Run, g: _Region) -> bool:
+        if r.removed:
+            return g.s <= r.removed[0][0] and r.removed[-1][0] <= g.e
+        return g.s <= r.before and r.before + 1 <= g.e
+
+    def outside(r: _Run, g: _Region) -> bool:
+        if r.removed:
+            return r.removed[-1][0] < g.s or r.removed[0][0] > g.e
+        return r.before + 1 <= g.s or r.before >= g.e
+
+    pure_comm: list[_Run] = []
+    for r in runs:
+        placed = False
+        for g in regions:
+            if inside(r, g):
+                g.runs.append(r)
+                g.delta += len(r.added) - len(r.removed)
+                placed = True
+                break
+        if placed:
+            continue
+        if id(r) not in comm_ids:
+            raise _Fallback
+        for g in regions:
+            if not outside(r, g):
+                raise _Fallback
+        pure_comm.append(r)
+
+    # -- items in file order; verify unchanged segments and compute new coordinates
+    items: list[tuple[float, str, object]] = []
+    for g in regions:
+        items.append((g.s, "r", g))
+    for r in pure_comm:
+        key = r.removed[0][0] if r.removed else r.before + 0.5
+        items.append((key, "c", r))
+    items.sort(key=lambda t: t[0])
+
+    cum = 0
+    prev_end = 0  # last old line consumed
+    for _, kind, obj in items:
+        if kind == "r":
+            g: _Region = obj  # type: ignore[assignment]
+            a_s, a_e = g.s, g.e
+        else:
+            r = obj  # type: ignore[assignment]
+            if r.removed:
+                a_s, a_e = r.removed[0][0], r.removed[-1][0]
+            else:
+                a_s, a_e = r.before + 1, r.before
+        if a_s - 1 < prev_end:
+            raise _Fallback
+        if old_lines[prev_end:a_s - 1] != new_lines[prev_end + cum:a_s - 1 + cum]:
+            raise _Fallback
+        if kind == "r":
+            g.ns = g.s + cum
+            g.ne = g.e + cum + g.delta
+            cum += g.delta
+        else:
+            r = obj  # type: ignore[assignment]
+            if [t for _, t in r.removed] != old_lines[a_s - 1:a_e]:
+                raise _Fallback
+            ns = a_s + cum
+            if [t for _, t in r.added] != new_lines[ns - 1:ns - 1 + len(r.added)]:
+                raise _Fallback
+            cum += len(r.added) - len(r.removed)
+        prev_end = a_e
+    if old_lines[prev_end:] != new_lines[prev_end + cum:]:
+        raise _Fallback
+
+    # -- verify and parse every region
+    code_new: set[int] = set()
+    views: list[tuple[int, int, _Index]] = []
+    all_equal = True
+    pos_changed = False
+    for g in regions:
+        _verify_region(old, g, new_lines, code_new)
+        old_nodes = g.group[g.i:g.j + 1]
+        eq = len(old_nodes) == len(g.new_nodes) and all(
+            ast.dump(a) == ast.dump(b) for a, b in zip(old_nodes, g.new_nodes))
+        if not eq:
+            all_equal = False
+        elif not pos_changed:
+            for a, b in zip(old_nodes, g.new_nodes):
+                for x, y in zip(ast.walk(a), ast.walk(b)):
+                    if getattr(x, "lineno", None) != getattr(y, "lineno", None) or getattr(
+                            x, "end_lineno", None) != getattr(y, "end_lineno", None):
+                        pos_changed = True
+                        break
+                if pos_changed:
+                    break
+
+    if all_equal:
+        pos_shift = pos_changed
+        if not pos_shift:
+            c = 0
+            prev = 0
+            for _, kind, obj in items:
+                if kind == "r":
+                    a_s, a_e, d = obj.s, obj.e, obj.delta  # type: ignore[attr-defined]
+                else:
+                    r = obj  # type: ignore[assignment]
+                    if r.removed:
+                        a_s, a_e = r.removed[0][0], r.removed[-1][0]
+                    else:
+                        a_s, a_e = r.before + 1, r.before
+                    d = len(r.added) - len(r.removed)
+                if c != 0 and _seg_has_code(old_lines, prev + 1, a_s - 1):
+                    pos_shift = True
+                    break
+                c += d
+                prev = a_e
+            if not pos_shift and c != 0 and _seg_has_code(old_lines, prev + 1, n_old):
+                pos_shift = True
+        return Impact("noop", lineno_shift=pos_shift, comment_text=added_text,
+                      insert_points=ipts, reason="identical AST")
+
+    for g in regions:
+        views.append((g.ns, g.ne, _build_view(old, g, new_lines, code_new)))
+    router = _Router(views, code_new)
+    return _lines_impact(old, router, runs, ipts, added_text, shift)
+
+
+def _seg_has_code(lines: list[str], a: int, b: int) -> bool:
+    for k in range(max(a, 1) - 1, min(b, len(lines))):
+        s = lines[k].strip()
+        if s and s[0] != "#":
+            return True
+    return False
+
+
+def _verify_region(old: _Index, g: _Region, new_lines: list[str], code_new: set[int]) -> None:
+    """Parse + compile the new text of the region on its own (see module docstring)."""
+    group = g.group
+    first = group[g.i]
+    old_first_line = old.lines[_start(first) - 1]
+    ws = _ws_of(old_first_line)
+    starts, ends = old.group_bounds(group)
+    if first.col_offset != len(ws):  # type: ignore[attr-defined]
+        raise _Fallback
+    if g.i > 0 and ends[g.i - 1] >= g.s:
+        raise _Fallback
+    if g.j < len(group) - 1 and starts[g.j + 1] <= g.e:
+        raise _Fallback
+    if (g.chain and not ws) or (not g.chain and ws):
+        raise _Fallback
+    text = "\n".join(new_lines[g.ns - 1:g.ne])
+    old_text = "\n".join(old.lines[g.s - 1:g.e])
+    if "__future__" in text or "__future__" in old_text:
+        raise _Fallback
+    if ws:
+        src = "if 1:\n" + text + "\n"
+        off = g.ns - 2
+    else:
+        src = text + "\n"
+        off = g.ns - 1
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        tree = ast.parse(src)
+        if ws:
+            if len(tree.body) != 1 or not isinstance(tree.body[0], ast.If) or tree.body[0].orelse:
+                raise _Fallback
+            nodes = tree.body[0].body
+        else:
+            nodes = tree.body
+        for n in nodes:
+            if n.col_offset != len(ws):
+                raise _Fallback
+        ast.increment_lineno(tree, off)
+        compile(tree, "<region>", "exec", dont_inherit=True)
+    for n in nodes:
+        if not isinstance(n, _DEFS):
+            seg = "\n".join(new_lines[_start(n) - 1:n.end_lineno])
+            if _SCOPE_GUARD_RE.search(seg):
+                raise _Fallback
+    if ws and nodes and _ws_of(new_lines[_start(nodes[0]) - 1]) != ws:
+        raise _Fallback
+    g.new_nodes = nodes
+    # lines carrying tokens (tokenizing the region standalone is exact: it starts and
+    # ends outside any bracket/string)
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text + "\n").readline):
+            if tok.type in _SKIP_TOK:
+                continue
+            code_new.update(range(tok.start[0] + g.ns - 1, tok.end[0] + g.ns))
+    except (tokenize.TokenError, SyntaxError, IndentationError):
+        raise _Fallback from None
+
+
+def _build_view(old: _Index, g: _Region, new_lines: list[str], code_new: set[int]) -> _Index:
+    """Tiny synthetic NEW module: shells of the enclosing classes + the parsed region."""
+    nodes = list(g.new_nodes)
+    body: list = nodes
+    inner_old = None
+    shells: list = []
+    # innermost shell first
+    grp = g.group
+    for k in reversed(g.chain):
+        sh = copy.copy(k)
+        sh.end_lineno = g.ne  # type: ignore[attr-defined]
+        if inner_old is None:
+            first = grp[0]
+            new_body = ([first] if g.i > 0 else []) + body
+        else:
+            new_body = ([k.body[0]] if k.body[0] is not inner_old else []) + body
+        sh.body = new_body
+        shells.append(sh)
+        body = [sh]
+        inner_old = k
+    module = ast.Module(body=body, type_ignores=[])
+    v = _Index(None, module, code=code_new, lines=new_lines)
+    # qualified names for chain shells and region nodes
+    prefix = ""
+    parent: ast.AST = module
+    for sh in reversed(shells):  # outermost first
+        v.qual[id(sh)] = prefix + sh.name
+        prefix = prefix + sh.name + "."
+        parent = sh
+    v._walk_groups([nodes], parent, prefix)
+    v._walked = True
+    return v
+
+
+class _Router:
+    """Routes NEW line lookups to the region view containing the line."""
+
+    def __init__(self, views: list[tuple[int, int, _Index]], code: set[int]):
+        self.views = sorted(views, key=lambda t: t[0])
+        self.starts = [v[0] for v in self.views]
+        self.code = code
+        self.qual: dict[int, str] = {}
+        for _, _, idx in self.views:
+            self.qual.update(idx.qual)
+
+    def find_unit(self, L: int):
+        k = bisect_right(self.starts, L) - 1
+        if k < 0 or L > self.views[k][1]:
+            raise _Fallback
+        return self.views[k][2].find_unit(L)

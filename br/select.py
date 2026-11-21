@@ -25,8 +25,10 @@ HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", "2500"))          # tests at least 
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"               # dynamic verification on/off
 HEAVY_WHEN_CLEAN = os.environ.get("BR_HEAVY_WHEN_CLEAN", "include")  # include | exclude
 MAX_VERIFY_CPU = float(os.environ.get("BR_MAX_VERIFY_CPU", "8"))     # per-commit cap on estimated verify CPU
-VERIFY_FACTOR = float(os.environ.get("BR_VERIFY_FACTOR", "1.0"))     # verify if est cpu <= factor * static cost
+VERIFY_FACTOR = float(os.environ.get("BR_VERIFY_FACTOR", "0.8"))
+EST_SCALE = float(os.environ.get("BR_EST_SCALE", "0.5"))     # verify if est cpu <= factor * static cost
 DATA_STATIC = os.environ.get("BR_DATA_STATIC", "1") == "1"            # data-only patches: emit readers without verifying
+WARM = os.environ.get("BR_WARM", "1") == "1"                          # pre-import unpatched sqlglot core in the parent
 NEED_3P = ("tests/test_executor.py", "tests/test_optimizer.py")
 
 
@@ -81,12 +83,13 @@ class Ctx:
     def est(self, nums):
         """Estimated CPU seconds to run these tests in one child process."""
         classes = set()
-        tot = 0.25
+        tot = 0.0
         for n in nums:
             c = self.cls_of[n]
             classes.add(c)
             tot += max(0.0005, self.cpu[n] - self.fix[c])
-        return tot + sum(self.fix[c] for c in classes)
+        # Isolated timings include one-off start-up work that a shared child pays once: scale down.
+        return 0.05 + EST_SCALE * (tot + sum(self.fix[c] for c in classes))
 
     def tr(self, s):
         """Translate a set of map test numbers into tests.json numbers."""
@@ -210,6 +213,9 @@ def _engine(ctx):
         ctx.mirror = overlay.Mirror(ROOT, os.path.join(TMP, "m"))
         ctx.mirror.build()
         ctx.verifier = engine.Verifier(os.path.join(TMP, "m"), preload=("unittest", "json", "concurrent.futures"))
+        if WARM:
+            # Import the unpatched core once in the parent; a child re-imports everything if a patch touches it.
+            ctx.verifier.warm(("sqlglot", "tests.helpers", "tests.dialects.test_dialect"))
     return ctx.verifier, ctx.mirror
 
 
@@ -245,7 +251,9 @@ def decide(ctx, commit, text, deadline):
     wall = min(max(10.0, est * 6 + 10), max(1.0, deadline - time.time() - 3))
     try:
         mir.apply(changes)
-        res = ver.verify(ids, stop_on_fail=True, timeouts=timeouts, wall_s=wall)
+        # Warm modules stay valid only if the patch touches no module already imported and nothing under tests/.
+        changed = None if any(p.startswith("tests/") for p in changes) else list(changes)
+        res = ver.verify(ids, stop_on_fail=True, timeouts=timeouts, wall_s=wall, changed=changed)
     finally:
         mir.restore()
     ctx.cpu_spent += res.cpu_s
