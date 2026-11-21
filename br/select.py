@@ -28,7 +28,7 @@ HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", "2500"))          # tests at least 
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"               # dynamic verification on/off
 HEAVY_WHEN_CLEAN = os.environ.get("BR_HEAVY_WHEN_CLEAN", "include")  # include | exclude
 MAX_VERIFY_CPU = float(os.environ.get("BR_MAX_VERIFY_CPU", "12"))     # per-commit cap on estimated verify CPU
-VERIFY_FACTOR = float(os.environ.get("BR_VERIFY_FACTOR", "0.9"))
+VERIFY_FACTOR = float(os.environ.get("BR_VERIFY_FACTOR", "0.85"))
 # Estimates are in seconds of the scoring machine, which runs about 3x faster than the recording machine.
 EST_SCALE = float(os.environ.get("BR_EST_SCALE", "0.33"))     # verify if est cpu <= factor * static cost
 DATA_STATIC = os.environ.get("BR_DATA_STATIC", "1") == "1"            # data-only patches: emit readers without verifying
@@ -40,15 +40,15 @@ REF_NARROW = os.environ.get("BR_REF_NARROW", "1") == "1"              # constant
 SLICE = os.environ.get("BR_SLICE", "1") == "1"                        # run only the affected fixture entries of loop tests
 MAX_TEST_CPU = float(os.environ.get("BR_MAX_TEST_CPU", "1.5"))           # a single test costing more than this is not run by us
 SAMPLE = os.environ.get("BR_SAMPLE", "1") == "1"                      # sample entries of loop tests too expensive to verify
-SAMPLE_CPU = float(os.environ.get("BR_SAMPLE_CPU", "0.5"))
+SAMPLE_CPU = float(os.environ.get("BR_SAMPLE_CPU", "0.3"))
 SAMPLE_TRUST = os.environ.get("BR_SAMPLE_TRUST", "1") == "1"          # drop a sampled test whenever its sample passes
-SAMPLE_MIN = int(os.environ.get("BR_SAMPLE_MIN", "6"))
+SAMPLE_MIN = int(os.environ.get("BR_SAMPLE_MIN", "3"))
 ADAPT = os.environ.get("BR_ADAPT", "1") == "1"                        # cheap stand-ins for the slowest tests
 MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
 GEN_MEM = "tests/test_generator.py::TestGenerator::test_generator_memory"
 EXECUTOR = "tests/test_executor.py::TestExecutor"
 POOL_CLASSES = {EXECUTOR, "tests/test_optimizer.py::TestOptimizer"}
-REC_SCALE = float(os.environ.get("BR_REC_SCALE", "0.72"))              # our CPU per recorded second, ordinary tests
+REC_SCALE = float(os.environ.get("BR_REC_SCALE", "0.85"))              # our CPU per recorded second, ordinary tests
 NO_RUN = set() if ADAPT else {MAX_NODES}
 DUCK1 = os.environ.get("BR_DUCK1", "0") == "1"
 CONTINUE = os.environ.get("BR_CONTINUE", "1") == "1"                  # keep verifying after a failure when it pays
@@ -59,6 +59,9 @@ DEBUG = os.environ.get("BR_DEBUG", "0") == "1"
 KEY_NARROW = os.environ.get("BR_KEY_NARROW", "0") == "1"              # table entries keyed by expression class
 DATA_STATIC_MAX = float(os.environ.get("BR_DATA_STATIC_MAX", "5"))    # ...unless emitting the readers is expensive
 DOC_NOOP = os.environ.get("BR_DOC_NOOP", "1") == "1"
+HEADER_NARROW = os.environ.get("BR_HEADER_NARROW", "1") == "1"        # function-header changes: only tests entering the function
+NO_HEADER_NARROW = {"sqlglot/executor/env.py"}                         # its functions' signatures are inspected, not just called
+TOP_SLICE = os.environ.get("BR_TOP_SLICE", "1") == "1"                # slice loop tests for class-level changes too
 NEED_3P = ("tests/test_executor.py", "tests/test_optimizer.py")
 
 
@@ -245,6 +248,39 @@ def _ref_users(ctx, path, old_text, old_lines):
         return None
 
 
+def _header_users(ctx, path, old_text, old_lines):
+    """All changed lines are in function headers (decorators, signature, default values). The function
+    object changes, so only tests that enter the function can be affected. Function entry is recorded on
+    the header lines. None when the change is not confined to function headers."""
+    try:
+        if path in NO_HEADER_NARROW:
+            return None
+        spans = _HEADERS.get(path)
+        if spans is None:
+            spans = []
+            for node in ast.walk(_tree(path, old_text)):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
+                    lo = min([node.lineno] + [d.lineno for d in node.decorator_list])
+                    hi = max(node.lineno, node.body[0].lineno - 1)
+                    first = node.body[0]
+                    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+                        hi = max(hi, first.end_lineno)      # a docstring is reported with the header
+                    spans.append((lo, hi))
+            _HEADERS[path] = spans
+        out = set()
+        for ln in old_lines:
+            hit = [(lo, hi) for lo, hi in spans if lo <= ln <= hi]
+            if not hit:
+                return None
+            lo, hi = max(hit)                                # innermost
+            for k in range(lo, hi + 1):
+                out |= maps.tests_for(path, k, "fn")
+        return ctx.tr(out)
+    except Exception:
+        return None
+
+
+_HEADERS = {}
 _EXPR = None
 
 
@@ -446,11 +482,16 @@ def analyze(ctx, text):
                     for ln in imp.old_lines:
                         anyc |= ctx.tr(maps.tests_for(old_p, ln, kind))
                     narrowed = None
-                    if level == "top" and CLASS_NARROW:
+                    header = None
+                    if level == "top" and HEADER_NARROW:
+                        header = _header_users(ctx, old_p, old_text, imp.old_lines)
+                    if header is not None:
+                        narrowed = header
+                    elif level == "top" and CLASS_NARROW:
                         narrowed = _class_users(ctx, old_p, imp.old_lines)
                     cc = set(narrowed) if narrowed is not None else set(anyc)
                     refs = None
-                    if level == "top" and REF_NARROW and cc:
+                    if level == "top" and REF_NARROW and cc and header is None:
                         refs = _ref_users(ctx, old_p, old_text, imp.old_lines)
                         if refs is not None:
                             # only tests that run code mentioning the name; but if this file itself reads the
@@ -467,8 +508,15 @@ def analyze(ctx, text):
                     if level == "top" and (narrowed is not None or refs is not None or keyed is not None):
                         probes.append(old_p)   # narrowing assumes the module still imports: check that
                     c |= cc
-                    impacts.append((old_p, sorted(imp.old_lines), "fn") if level == "fn" else (old_p, [], None))
-                    notes.append(f"{p}: lines/{level}{'/cls' if narrowed is not None else ''}"
+                    if level == "fn":
+                        impacts.append((old_p, sorted(imp.old_lines), "fn"))
+                    elif TOP_SLICE and header is None and (narrowed is not None or refs is not None):
+                        # An import-time statement can only matter to fixture entries that load this module:
+                        # those are the entries whose own coverage contains the statement's lines.
+                        impacts.append((old_p, sorted(imp.old_lines), "any"))
+                    else:
+                        impacts.append((old_p, [], None))
+                    notes.append(f"{p}: lines/{level}{'/hdr' if header is not None else '/cls' if narrowed is not None else ''}"
                                  f"{'/ref' if refs is not None else ''}{'/key' if keyed is not None else ''} "
                                  f"{sorted(imp.old_lines)[:6]} -> {len(cc)}")
                 elif k == "syntax_error":
@@ -911,7 +959,18 @@ def decide(ctx, commit, text, deadline):
                     second.remove(n)        # too costly to settle: the sampled test is simply kept
                 else:
                     extra |= rel
-            run2 = [ctx.ids[n] for n in sorted(extra, key=lambda n: vcost[n])] + [ctx.ids[n] for n in second]
+            if extra:
+                # First settle the related tests (stop at the first failure): if one fails, the sampled
+                # test is kept anyway and its sample need not run.
+                res = go([ctx.ids[n] for n in sorted(extra, key=lambda n: vcost[n])], [], True)
+                results.update(res.results)
+                cpus.update(res.cpus)
+                cpu += res.cpu_s
+                failed = {ctx.num[i] for i, o in results.items() if o != "pass" and i in ctx.num}
+                passed = {ctx.num[i] for i, o in results.items() if o == "pass" and i in ctx.num}
+                pending = set(order) - sampled - passed - failed
+                second = [n for n in second if not _rel_set(ctx, n, failed | pending)]
+            run2 = [ctx.ids[n] for n in second]
             if run2:
                 res = go(run2, run2, False)
                 results.update(res.results)
