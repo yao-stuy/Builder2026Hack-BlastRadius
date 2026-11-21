@@ -47,6 +47,8 @@ def main():
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     cdir = os.path.join(DATA, "commits")
     commits = sorted(f[:-6] for f in os.listdir(cdir) if f.endswith(".patch"))
+    if os.environ.get("BR_REVERSE") == "1":   # test aid: answers must not depend on processing order
+        commits.reverse()
     full = pack(sorted(ms.items()))
 
     answers = {}

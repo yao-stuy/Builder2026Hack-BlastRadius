@@ -28,7 +28,7 @@ HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", "2500"))          # tests at least 
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"               # dynamic verification on/off
 HEAVY_WHEN_CLEAN = os.environ.get("BR_HEAVY_WHEN_CLEAN", "include")  # include | exclude
 MAX_VERIFY_CPU = float(os.environ.get("BR_MAX_VERIFY_CPU", "12"))     # per-commit cap on estimated verify CPU
-VERIFY_FACTOR = float(os.environ.get("BR_VERIFY_FACTOR", "0.75"))
+VERIFY_FACTOR = float(os.environ.get("BR_VERIFY_FACTOR", "0.9"))
 # Estimates are in seconds of the scoring machine, which runs about 3x faster than the recording machine.
 EST_SCALE = float(os.environ.get("BR_EST_SCALE", "0.33"))     # verify if est cpu <= factor * static cost
 DATA_STATIC = os.environ.get("BR_DATA_STATIC", "1") == "1"            # data-only patches: emit readers without verifying
@@ -55,6 +55,8 @@ REL_CPU = float(os.environ.get("BR_REL_CPU", "3.0"))
 ALWAYS = os.environ.get("BR_ALWAYS", "0") == "1"
 DEBUG = os.environ.get("BR_DEBUG", "0") == "1"
 KEY_NARROW = os.environ.get("BR_KEY_NARROW", "0") == "1"              # table entries keyed by expression class
+DATA_STATIC_MAX = float(os.environ.get("BR_DATA_STATIC_MAX", "5"))    # ...unless emitting the readers is expensive
+DOC_NOOP = os.environ.get("BR_DOC_NOOP", "1") == "1"
 NEED_3P = ("tests/test_executor.py", "tests/test_optimizer.py")
 
 
@@ -186,7 +188,7 @@ def _ref_users(ctx, path, old_text, old_lines):
     tree that mentions NAME (textually, so comments and strings count too) and return the tests that
     execute any of those lines. Returns None when the change is not of that simple form."""
     try:
-        tree = ast.parse(old_text)
+        tree = _tree(path, old_text)
         names = set()
         own = set()
         todo = [tree]
@@ -306,6 +308,49 @@ def _key_users(ctx, old_text, old_lines):
         return None
 
 
+def _strip_strings(tree):
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if isinstance(body, list):
+            node.body = [st for st in body
+                         if not (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant)
+                                 and isinstance(st.value.value, str))] or [ast.Pass()]
+    return tree
+
+
+_TREES = {}
+_SPANS = {}
+
+
+def _tree(path, text):
+    """Parsed pristine source, cached per file (do not mutate the result)."""
+    t = _TREES.get(path)
+    if t is None:
+        t = _TREES[path] = ast.parse(text)
+    return t
+
+
+def _only_strings_differ(path, old_text, new_text, removed):
+    """True when the two sources are the same program once bare string statements are removed."""
+    try:
+        if not removed:
+            return False
+        spans = _SPANS.get(path)
+        if spans is None:
+            spans = _SPANS[path] = [
+                (st.lineno, st.end_lineno) for node in ast.walk(_tree(path, old_text))
+                for st in (getattr(node, "body", None) if isinstance(getattr(node, "body", None), list) else ())
+                if isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant) and isinstance(st.value.value, str)]
+        # cheap gate: every edited line must sit inside a bare string statement of the old file
+        if not all(any(lo <= ln <= hi for lo, hi in spans) for ln in removed):
+            return False
+        a = ast.dump(_strip_strings(ast.parse(old_text)))
+        b = ast.dump(_strip_strings(ast.parse(new_text)))
+        return a == b
+    except Exception:
+        return False
+
+
 def analyze(ctx, text):
     """-> (candidates: set[int], certain: bool, changes: dict[path, bytes|None], notes: list[str])"""
     try:
@@ -374,8 +419,17 @@ def analyze(ctx, text):
             else:
                 imp = classify.classify(old_p, old_text, new_text, fp)
                 k = imp.kind
+                if (k in ("lines", "whole_file") and DOC_NOOP
+                        and _only_strings_differ(old_p, old_text, new_text, diffparse.removed_old_lines(fp))):
+                    # Only docstrings / bare string statements changed. Nothing in the tree reads __doc__
+                    # (checked at the pinned commit), so no listed test can observe it.
+                    k = "noop"
+                    notes.append(f"{p}: docstring only")
+                elif k == "noop":
+                    pass
                 if k == "noop":
-                    notes.append(f"{p}: noop")
+                    if not notes or not notes[-1].startswith(p + ": docstring"):
+                        notes.append(f"{p}: noop")
                 elif k == "lines":
                     level = imp.level
                     if level == "fn":
@@ -467,62 +521,6 @@ def _cost(ctx, nums):
     if not nums:
         return 0.0
     return pack.cost_of_ms(pack.best([(n, ctx.ms[n]) for n in nums]), ctx.ms) / 1000
-
-
-def decide_v1(ctx, commit, text, deadline):
-    cand, certain, changes, notes, py_impact = analyze(ctx, text)
-    info = {"cand": len(cand), "notes": notes, "verified": 0, "cpu": 0.0, "how": ""}
-    if not cand:
-        info["how"] = "no candidates"
-        return set(), info
-    if certain:
-        info["how"] = "certain"
-        return cand, info
-    if DATA_STATIC and not py_impact:
-        # A changed fixture almost always breaks the test that reads it; running it first only costs CPU.
-        info["how"] = "data file change, static"
-        return cand, info
-    heavy = {n for n in cand if ctx.ms[n] >= HEAVY_MS}
-    unrel = (cand - heavy) & ctx.unreliable
-    light = cand - heavy - unrel
-    static_cost = _cost(ctx, cand)
-    # What we would still have to emit if every light candidate passes.
-    residual = set(unrel) | (heavy if HEAVY_WHEN_CLEAN == "include" else set())
-    gain = static_cost - _cost(ctx, residual)
-    est = ctx.est(light)
-    if (not VERIFY or not light or est > MAX_VERIFY_CPU or est > VERIFY_FACTOR * gain
-            or time.time() + est * 2 + 5 > deadline):
-        info["how"] = f"static (est {est:.1f}s vs gain {gain:.1f}s of {static_cost:.1f}s)"
-        return cand, info
-
-    ver, mir = _engine(ctx)
-    order = _order(ctx, light, changes)
-    ids = [ctx.ids[n] for n in order]
-    if any(ctx.file_of[n] in NEED_3P for n in order):
-        ver.ensure_preloaded(("duckdb", "pandas", "numpy"))
-    timeouts = {ctx.ids[n]: max(3.0, 8 * ctx.cpu[n]) for n in order}
-    wall = min(max(10.0, est * 6 + 10), max(1.0, deadline - time.time() - 3))
-    try:
-        mir.apply(changes)
-        # Warm modules stay valid only if the patch touches no module already imported and nothing under tests/.
-        changed = None if any(p.startswith("tests/") for p in changes) else list(changes)
-        res = ver.verify(ids, stop_on_fail=True, timeouts=timeouts, wall_s=wall, changed=changed)
-    finally:
-        mir.restore()
-    ctx.cpu_spent += res.cpu_s
-    info["cpu"] = res.cpu_s
-    info["verified"] = len(res.results)
-    passed = {ctx.num[i] for i, o in res.results.items() if o == "pass"}
-    failed = {ctx.num[i] for i, o in res.results.items() if o != "pass"}
-    pending = set(order) - passed - failed  # not run, or in progress when the child died
-    if failed or pending:
-        info["how"] = f"fail found ({len(failed)} failed, {len(pending)} unverified)"
-        return failed | pending | heavy | unrel, info
-    sel = set(unrel)
-    if heavy and HEAVY_WHEN_CLEAN == "include":
-        sel |= heavy
-    info["how"] = f"clean ({len(passed)} passed, heavy {len(heavy)} {HEAVY_WHEN_CLEAN})"
-    return sel, info
 
 
 def _slice_plan(ctx, n, impacts, data):
@@ -696,7 +694,7 @@ def decide(ctx, commit, text, deadline):
     if certain:
         info["how"] = "certain"
         return cand, info
-    if DATA_STATIC and not py_impact:
+    if DATA_STATIC and not py_impact and _cost(ctx, cand) <= DATA_STATIC_MAX:
         # A changed fixture almost always breaks the test that reads it; running it first only costs CPU.
         info["how"] = "data file change, static"
         return cand | _probe_only(ctx, changes, deadline), info
