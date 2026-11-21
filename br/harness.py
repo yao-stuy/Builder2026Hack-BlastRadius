@@ -82,15 +82,53 @@ class InlineExecutor:
         return False
 
 
+FAIL_FAST = os.environ.get("BR_FAILFAST", "1") == "1"
 _FIX_RE = re.compile(r"^(\w+) \((.*)\)$")
 _ErrorHolder = unittest.suite._ErrorHolder
 _SubTest = unittest.case._SubTest
+
+
+def _registry():
+    m = sys.modules.get("sqlglot.dialects.dialect")
+    d = getattr(getattr(m, "Dialect", None), "_classes", None)
+    return d if isinstance(d, dict) else None
+
+
+def _registry_snapshot():
+    """The dialect registry before a test. tests/test_dialect_entry_points.py empties it and never puts the
+    entries back; every test recorded and labeled in isolation saw a registry nobody had emptied, so the
+    tests that follow in this process must see one too."""
+    try:
+        d = _registry()
+        return dict(d) if d is not None else None
+    except Exception:
+        return None
+
+
+def _registry_repair(before):
+    """Put back registry entries that the test removed (entries it added stay)."""
+    try:
+        d = _registry()
+        if before and d is not None:
+            for k, v in before.items():
+                if k not in d:
+                    d[k] = v
+    except Exception:
+        pass
 
 
 class _Result(unittest.TestResult):
     def __init__(self, owner):
         super().__init__()
         self.o = owner
+        # With failfast, unittest leaves a test body as soon as one of its subtests has failed. The test's
+        # outcome is already decided at that point, so the remaining subtests are only cost.
+        self.failfast = FAIL_FAST
+
+    def stop(self):
+        # failfast calls this on every failure; whether the whole run ends is the owner's decision.
+        if self.o.stop_on_fail or not FAIL_FAST:
+            self.shouldStop = True
 
     def startTest(self, test):
         super().startTest(test)
@@ -147,6 +185,7 @@ class _Run:
         self.last = None
         self.mark = 0.0
         self.result = None
+        self.registry = None
 
     def stopping(self):
         return self.result is not None and self.result.shouldStop
@@ -165,6 +204,7 @@ class _Run:
         if tid is None:
             return
         self.cur = tid
+        self.registry = _registry_snapshot()
         lim = self._limit(tid)
         if lim and lim > 0:
             signal.setitimer(signal.ITIMER_REAL, lim, 0.2)
@@ -174,6 +214,8 @@ class _Run:
         tid = self.by_inst.get(id(test))
         if tid is None:
             return
+        _registry_repair(self.registry)
+        self.registry = None
         now = time.process_time()
         self.cpu[tid] = self.cpu.get(tid, 0.0) + (now - self.mark)
         self.mark = now
