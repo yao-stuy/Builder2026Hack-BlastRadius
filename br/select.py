@@ -762,6 +762,23 @@ def _rel_set(ctx, n, others):
         return set(others) - {n}
 
 
+def _touches_executor_setup(ctx, changes):
+    """Does the patch change a file under tests/ that some executor test reads or executes
+    (its helpers, its own module, its data files)? Then the shared set-up may be affected."""
+    try:
+        for q in changes:
+            if not q.startswith("tests/"):
+                continue
+            users = set(ctx.tr(maps.tests_reading(q)))
+            if q.endswith(".py"):
+                users |= ctx.tr(maps.tests_for_file(q, "any")) if maps.known_file(q) else set(ctx.all)
+            if any(ctx.cls_of[n] == EXECUTOR for n in users):
+                return True
+        return False
+    except Exception:
+        return True
+
+
 def _gm_dialects(impacts, data):
     """Dialects whose own code contains a changed line; None = all dialects."""
     if data:
@@ -830,7 +847,7 @@ def decide(ctx, commit, text, deadline):
         info["how"] = "data file change, static"
         return cand | _probe_only(ctx, changes, deadline), info
     static_cost = _cost(ctx, cand)
-    lazy_ok = (ADAPT and not any(q.startswith("tests/") for q in changes)
+    lazy_ok = (ADAPT and not _touches_executor_setup(ctx, changes)
                and sum(1 for n in cand if ctx.cls_of[n] == EXECUTOR) < ctx.n_exec)
 
     # Per-test plan and estimated CPU to verify it.
@@ -937,10 +954,7 @@ def decide(ctx, commit, text, deadline):
     # Lazy table loading skips set-up work the selected tests do not need. That is only faithful when the
     # patch cannot break the set-up itself: nothing under tests/ changed, and the change is not in code that
     # every executor test runs (set-up code is covered by all of them).
-    exec_cand = sum(1 for n in cand if ctx.cls_of[n] == EXECUTOR)
-    lazy = (ADAPT and any(ctx.cls_of[n] == EXECUTOR for n in V)
-            and not any(q.startswith("tests/") for q in changes)
-            and exec_cand < ctx.n_exec)
+    lazy = lazy_ok and any(ctx.cls_of[n] == EXECUTOR for n in V)
 
     def prepare(h):
         if DUCK1 and "duckdb" in sys.modules:
