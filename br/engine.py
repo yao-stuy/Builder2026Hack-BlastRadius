@@ -11,6 +11,9 @@ import time
 from dataclasses import dataclass, field
 
 
+GC_FREEZE = os.environ.get("BR_GC_FREEZE", "1") == "1"
+
+
 @dataclass
 class VerifyResult:
     results: dict = field(default_factory=dict)
@@ -50,7 +53,26 @@ class Verifier:
         self.harness = harness_module
         self.loaded = set()
         self.warm_mods = set()
+        self._preload_std()
         self.ensure_preloaded(preload)
+        try:
+            self._harness()  # import br.harness in the parent so children do not
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Stdlib / third-party modules that many tests import (directly or via unittest.mock).
+    # Importing them in the parent is outcome-neutral and saves ~0.1 s CPU per child.
+    _STD_PRELOAD = ("unittest", "unittest.mock", "asyncio", "pickle", "decimal", "fractions",
+                    "difflib", "tracemalloc", "tempfile", "subprocess", "sysconfig", "pytz",
+                    "zoneinfo", "dateutil.relativedelta", "dateutil.parser")
+
+    def _preload_std(self):
+        for n in self._STD_PRELOAD:
+            try:
+                importlib.import_module(n)
+                self.loaded.add(n)
+            except Exception:  # noqa: BLE001
+                pass
 
     def ensure_preloaded(self, names):
         for n in names:
@@ -253,6 +275,11 @@ class Verifier:
             self._purge_if_stale(changed)
             h = self._harness()
             h.setup(self.root)
+            if GC_FREEZE:
+                # Everything inherited from the parent (interpreter, pandas, duckdb, warm sqlglot) is live for
+                # the whole run; keep the collector from re-scanning it on every collection.
+                import gc
+                gc.freeze()
             specials = specials or {}
             if prepare is not None:
                 prepare(h)
@@ -283,12 +310,13 @@ class Verifier:
                 if fn is None:
                     continue
                 emit({"s": tid})
+                t0 = time.process_time()
                 try:
                     o = fn()
                 except BaseException:  # noqa: BLE001
                     o = None
                 if o in ("pass", "fail"):
-                    emit({"r": tid, "o": o})
+                    emit({"r": tid, "o": o, "c": round(time.process_time() - t0, 3)})
                 else:
                     emit({"x": tid})
             code = 0

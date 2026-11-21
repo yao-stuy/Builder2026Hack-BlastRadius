@@ -100,6 +100,10 @@ class _Result(unittest.TestResult):
         self.o.stop(test)
         super().stopTest(test)
 
+    def _exc_info_to_string(self, err, test):
+        # Only the pass/fail outcome is used; formatting tracebacks is pure overhead.
+        return ""
+
     def _bad(self, test):
         if isinstance(test, _SubTest):
             test = test.test_case

@@ -28,9 +28,9 @@ HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", "2500"))          # tests at least 
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"               # dynamic verification on/off
 HEAVY_WHEN_CLEAN = os.environ.get("BR_HEAVY_WHEN_CLEAN", "include")  # include | exclude
 MAX_VERIFY_CPU = float(os.environ.get("BR_MAX_VERIFY_CPU", "12"))     # per-commit cap on estimated verify CPU
-VERIFY_FACTOR = float(os.environ.get("BR_VERIFY_FACTOR", "1.0"))
+VERIFY_FACTOR = float(os.environ.get("BR_VERIFY_FACTOR", "0.75"))
 # Estimates are in seconds of the scoring machine, which runs about 3x faster than the recording machine.
-EST_SCALE = float(os.environ.get("BR_EST_SCALE", "0.15"))     # verify if est cpu <= factor * static cost
+EST_SCALE = float(os.environ.get("BR_EST_SCALE", "0.33"))     # verify if est cpu <= factor * static cost
 DATA_STATIC = os.environ.get("BR_DATA_STATIC", "1") == "1"            # data-only patches: emit readers without verifying
 WARM = os.environ.get("BR_WARM", "1") == "1"                          # pre-import unpatched sqlglot core in the parent
 CLASS_NARROW = os.environ.get("BR_CLASS_NARROW", "1") == "1"          # class-body changes: only tests using the class
@@ -47,8 +47,12 @@ ADAPT = os.environ.get("BR_ADAPT", "1") == "1"                        # cheap st
 MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
 GEN_MEM = "tests/test_generator.py::TestGenerator::test_generator_memory"
 EXECUTOR = "tests/test_executor.py::TestExecutor"
+POOL_CLASSES = {EXECUTOR, "tests/test_optimizer.py::TestOptimizer"}
+REC_SCALE = float(os.environ.get("BR_REC_SCALE", "0.72"))              # our CPU per recorded second, ordinary tests
 NO_RUN = set() if ADAPT else {MAX_NODES}
 DUCK1 = os.environ.get("BR_DUCK1", "0") == "1"
+REL_CPU = float(os.environ.get("BR_REL_CPU", "3.0"))
+ALWAYS = os.environ.get("BR_ALWAYS", "0") == "1"
 DEBUG = os.environ.get("BR_DEBUG", "0") == "1"
 KEY_NARROW = os.environ.get("BR_KEY_NARROW", "0") == "1"              # table entries keyed by expression class
 NEED_3P = ("tests/test_executor.py", "tests/test_optimizer.py")
@@ -613,19 +617,20 @@ def _probe_only(ctx, changes, deadline):
     return _importers(ctx, [p for i, p in zip(ids, probes) if res.results.get(i) != "pass"])
 
 
-def _related(ctx, n, others):
+def _rel_set(ctx, n, others):
+    """Members of `others` closely related to test n: same test class, or driven by the same fixture file."""
     try:
-        fx = set(entrymaps.sliceable(n) or ())
+        def fixtures(t):
+            return {f for f in (entrymaps.sliceable(t) or ()) if not entrymaps.unused(t, f)}
+        fx = fixtures(n)
+        same_class = ctx.cls_of[n] == EXECUTOR   # executor tests share tables and engine; optimizer tests do not
+        out = set()
         for o in others:
-            if o == n:
-                continue
-            if ctx.cls_of[o] == ctx.cls_of[n]:
-                return True
-            if fx & set(entrymaps.sliceable(o) or ()):
-                return True
-        return False
+            if o != n and ((same_class and ctx.cls_of[o] == ctx.cls_of[n]) or fx & fixtures(o)):
+                out.add(o)
+        return out
     except Exception:
-        return True
+        return set(others) - {n}
 
 
 def _gm_dialects(impacts, data):
@@ -725,7 +730,12 @@ def decide(ctx, commit, text, deadline):
             continue
         frac, sel = _slice_plan(ctx, n, impacts, data)
         plan[n] = sel
-        full_cost = max(0.0005, ctx.cpu[n] - ctx.fix[ctx.cls_of[n]]) * EST_SCALE
+        if ctx.cls_of[n] in POOL_CLASSES:
+            # these run their work through a process pool when recorded; use our own measured CPU
+            full_cost = max(0.0005, ctx.cpu[n] - ctx.fix[ctx.cls_of[n]]) * EST_SCALE
+        else:
+            # ordinary tests cost us a fraction of their recorded seconds on the scoring machine
+            full_cost = max(0.0003, ctx.ms[n] / 1000 * REC_SCALE)
         vcost[n] = full_cost * frac
         if vcost[n] > MAX_TEST_CPU:
             smp = _sample(ctx, n, sel, full_cost) if SAMPLE else None
@@ -737,7 +747,8 @@ def decide(ctx, commit, text, deadline):
                 sampled.add(n)
 
     def est(vs):
-        return 0.02 + sum(vcost[n] for n in vs) + EST_SCALE * sum(ctx.fixcost[c] for c in {ctx.cls_of[n] for n in vs})
+        return 0.02 + sum(vcost[n] for n in vs) + EST_SCALE * sum(
+            ctx.fixcost[c] for c in {ctx.cls_of[n] for n in vs} if c in POOL_CLASSES)
 
     # Leave out of verification the tests that cost more to run than to simply emit.
     V = set(vcost)
@@ -783,7 +794,9 @@ def decide(ctx, commit, text, deadline):
     order = _order(ctx, V, changes)
     ids = [ctx.ids[n] for n in order]
     # Tests that are expensive to emit but cheap to check run first, and a failure elsewhere never skips them.
-    always = [ctx.ids[n] for n in order if n in sampled or (ctx.ms[n] >= 1000 and vcost[n] < 0.7 * ctx.ms[n] / 1000)]
+    # Once any test fails the rest is emitted unverified, so nothing is worth running "regardless":
+    # plain cheapest-first order, stop at the first failure.
+    always = [ctx.ids[n] for n in order if ALWAYS and (ctx.ms[n] >= 1000 and vcost[n] < 0.7 * ctx.ms[n] / 1000)]
     if any(ctx.file_of[n] in NEED_3P for n in order):
         ver.ensure_preloaded(("duckdb", "pandas", "numpy"))
     timeouts = {ctx.ids[n]: max(3.0, 8 * ctx.cpu[n]) for n in order}
@@ -837,48 +850,90 @@ def decide(ctx, commit, text, deadline):
 
             te.TestExecutor.setUpClass = classmethod(setup)
 
+    def go(run_ids, always_ids, stop):
+        want = set(run_ids)
+        return ver.verify(run_ids, stop_on_fail=stop, timeouts=timeouts,
+                          wall_s=min(wall, max(1.0, deadline - time.time() - 3)), changed=changed,
+                          prepare=prepare, always=always_ids,
+                          specials={**{t: f for t, f in specials.items() if t in want},
+                                    **{"probe::" + q: _probe_fn(q) for q in ctx.probes if "probe::" + q in want}})
+
+    results = {}
+    cpus = {}
+    cpu = 0.0
     try:
         mir.apply(changes)
         # Warm modules stay valid only if the patch touches no module already imported and nothing under tests/.
         changed = None if any(p.startswith("tests/") for p in changes) else list(changes)
-        res = ver.verify(ids + ["probe::" + p for p in ctx.probes], stop_on_fail=True, timeouts=timeouts,
-                         wall_s=wall, changed=changed,
-                         prepare=prepare, always=always,
-                         specials={**{t: f for t, f in specials.items() if ctx.num[t] in V},
-                                   **{"probe::" + p: _probe_fn(p) for p in ctx.probes}})
+        # Phase 1: everything except the sampled tests; stop at the first failure.
+        first = [i for i in ids if ctx.num[i] not in sampled] + ["probe::" + q for q in ctx.probes]
+        res = go(first, [i for i in always if ctx.num[i] not in sampled], True) if first else None
+        if res is not None:
+            results.update(res.results)
+            cpus.update(res.cpus)
+            cpu += res.cpu_s
+            if res.died or res.error:
+                ctx.log(f"   child problem: died={res.died} timed_out={res.timed_out} error={res.error} suspect={res.suspect}")
+        broken = [q for q in ctx.probes if results.pop("probe::" + q, None) != "pass"]
+        failed = {ctx.num[i] for i, o in results.items() if o != "pass" and i in ctx.num}
+        passed = {ctx.num[i] for i, o in results.items() if o == "pass" and i in ctx.num}
+        pending = set(order) - sampled - passed - failed
+        # Phase 2: the sampled tests. One that is closely related to a test that already failed is kept
+        # without running it. Related tests phase 1 did not reach are run now, so the decision rests on facts.
+        second = []
+        if sampled and not broken:
+            for n in sorted(sampled, key=lambda n: vcost[n]):
+                if SAMPLE_TRUST and _rel_set(ctx, n, failed):
+                    continue
+                if not SAMPLE_TRUST and (failed or pending):
+                    continue
+                second.append(n)
+            extra = set()
+            for n in list(second):
+                rel = _rel_set(ctx, n, pending)
+                if sum(vcost[o] for o in rel) > REL_CPU:
+                    second.remove(n)        # too costly to settle: the sampled test is simply kept
+                else:
+                    extra |= rel
+            run2 = [ctx.ids[n] for n in sorted(extra, key=lambda n: vcost[n])] + [ctx.ids[n] for n in second]
+            if run2:
+                res = go(run2, run2, False)
+                results.update(res.results)
+                cpus.update(res.cpus)
+                cpu += res.cpu_s
+                if res.died or res.error:
+                    ctx.log(f"   child problem: died={res.died} timed_out={res.timed_out} error={res.error} suspect={res.suspect}")
+                failed = {ctx.num[i] for i, o in results.items() if o != "pass" and i in ctx.num}
+                passed = {ctx.num[i] for i, o in results.items() if o == "pass" and i in ctx.num}
+                pending = set(order) - sampled - passed - failed
     finally:
         mir.restore()
-    ctx.cpu_spent += res.cpu_s
-    info["cpu"] = res.cpu_s
-    info["verified"] = len(res.results)
-    broken = [p for p in ctx.probes if res.results.pop("probe::" + p, None) != "pass"]
-    # ids we did not ask for (helper test cases run by stand-ins) are ignored
-    passed = {ctx.num[i] for i, o in res.results.items() if o == "pass" and i in ctx.num}
-    failed = {ctx.num[i] for i, o in res.results.items() if o != "pass" and i in ctx.num}
-    pending = set(order) - passed - failed  # not run, or in progress when the child died
+    ctx.cpu_spent += cpu
+    info["cpu"] = cpu
+    info["verified"] = len(results)
     if broken:
         info["how"] = "module no longer imports (or the check did not finish)"
         return failed | pending | U | sampled | _importers(ctx, broken), info
-    if res.died or res.error:
-        ctx.log(f"   child problem: died={res.died} timed_out={res.timed_out} error={res.error} suspect={res.suspect}")
-    if DEBUG and res.cpu_s > 2:
-        top = sorted(res.cpus.items(), key=lambda kv: -kv[1])[:8]
+    if DEBUG and cpu > 2:
+        top = sorted(cpus.items(), key=lambda kv: -kv[1])[:8]
         ctx.log("   cpu by test: " + ", ".join(f"{t.split('::')[-1]}={c:.2f}(est {vcost.get(ctx.num.get(t), 0):.2f})" for t, c in top)
-                + f" | sum {sum(res.cpus.values()):.1f} of {res.cpu_s:.1f}")
+                + f" | sum {sum(cpus.values()):.1f} of {cpu:.1f}")
     nsl = sum(1 for n in V if plan[n] is not None)
-    if failed or pending:
-        # A sampled test that passed its sample is still emitted when something else failed.
+    # A sampled test is dropped only when its sample passed and no failed or unverified test is closely
+    # related to it (same test class, or driven by the same fixture file).
+    keep = set()
+    for n in sampled:
+        if n in failed:
+            continue
+        if n not in passed or _rel_set(ctx, n, failed | pending) or (not SAMPLE_TRUST and (failed or pending)):
+            keep.add(n)
+    if failed or pending or keep:
         info["how"] = (f"fail found ({len(failed)} failed, {len(pending)} unverified, {len(U)} not run, "
-                       f"{nsl} sliced, {len(sampled)} sampled, est {e:.1f}s)")
-        # A sampled test whose sample passed is dropped unless a failed test is closely related to it
-        # (same test class, or driven by the same fixture file): then its own failure is likely.
-        keep = set()
-        for n in sampled:
-            if n not in passed or not SAMPLE_TRUST or _related(ctx, n, failed | pending):
-                keep.add(n)
+                       f"{nsl} sliced, {len(sampled)} sampled, {len(keep)} kept, est {e:.1f}s)")
         if DEBUG:
             ctx.log("   failed: " + ", ".join(ctx.ids[n].split("::")[-1] for n in sorted(failed))[:300]
-                    + " | sampled passed: " + ", ".join(ctx.ids[n].split("::")[-1] for n in sorted(sampled & passed)))
+                    + " | sampled passed: " + ", ".join(ctx.ids[n].split("::")[-1] for n in sorted(sampled & passed))
+                    + " | kept: " + ", ".join(ctx.ids[n].split("::")[-1] for n in sorted(keep)))
         return failed | pending | U | keep, info
     info["how"] = f"clean ({len(passed)} passed, {len(U)} not run, {nsl} sliced, {len(sampled)} sampled, est {e:.1f}s)"
     return set(U), info
