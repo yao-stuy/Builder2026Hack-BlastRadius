@@ -27,7 +27,7 @@ TMP = os.environ.get("BR_TMP", "/tmp/br")
 HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", "2500"))          # tests at least this long are never run by us
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"               # dynamic verification on/off
 HEAVY_WHEN_CLEAN = os.environ.get("BR_HEAVY_WHEN_CLEAN", "include")  # include | exclude
-MAX_VERIFY_CPU = float(os.environ.get("BR_MAX_VERIFY_CPU", "30"))     # per-commit cap on estimated verify CPU (scoring-machine seconds)
+MAX_VERIFY_CPU = float(os.environ.get("BR_MAX_VERIFY_CPU", "15"))     # per-commit cap on estimated verify CPU
 VERIFY_FACTOR = float(os.environ.get("BR_VERIFY_FACTOR", "0.85"))
 # Estimates are in seconds of the scoring machine, which runs about 3x faster than the recording machine.
 EST_SCALE = float(os.environ.get("BR_EST_SCALE", "0.33"))     # verify if est cpu <= factor * static cost
@@ -58,10 +58,10 @@ CONTINUE = os.environ.get("BR_CONTINUE", "1") == "1"                  # keep ver
 CONT_FACTOR = float(os.environ.get("BR_CONT_FACTOR", "0.6"))
 REL_CPU = float(os.environ.get("BR_REL_CPU", "3.0"))
 POOL_SPLIT = os.environ.get("BR_POOL_SPLIT", "1") == "1"
-# The scoring machine spends more CPU than our per-test estimates say: measured factors, used only when
-# weighing a verification's CPU against the test seconds it can save (never to choose slices or samples).
-POOL_F = float(os.environ.get("BR_POOL_F", "3.5"))                 # optimizer/executor loop tests
-ORD_F = float(os.environ.get("BR_ORD_F", "1.5"))                   # every other test
+# Optional weights on a verification's estimated CPU when it is compared with the test seconds it can save
+# (never used to choose slices or samples). 1.0 = unweighted; heavier weights scored worse on the practice board.
+POOL_F = float(os.environ.get("BR_POOL_F", "1.0"))                 # optimizer/executor loop tests
+ORD_F = float(os.environ.get("BR_ORD_F", "1.0"))                   # every other test
 AUDIT = os.environ.get("BR_AUDIT", "0") == "1"                        # test aid: verify everything, report verdicts
 AUDIT_CAP = float(os.environ.get("BR_AUDIT_CAP", "25"))
 ALWAYS = os.environ.get("BR_ALWAYS", "0") == "1"
