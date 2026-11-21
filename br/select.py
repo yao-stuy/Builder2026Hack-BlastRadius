@@ -42,7 +42,7 @@ MAX_TEST_CPU = float(os.environ.get("BR_MAX_TEST_CPU", "1.5"))           # a sin
 SAMPLE = os.environ.get("BR_SAMPLE", "1") == "1"                      # sample entries of loop tests too expensive to verify
 SAMPLE_CPU = float(os.environ.get("BR_SAMPLE_CPU", "0.3"))
 SAMPLE_TRUST = os.environ.get("BR_SAMPLE_TRUST", "1") == "1"          # drop a sampled test whenever its sample passes
-SLICE_CAP = float(os.environ.get("BR_SLICE_CAP", "18"))               # most CPU spent on one exact slice
+SLICE_CAP = float(os.environ.get("BR_SLICE_CAP", "8"))               # most CPU spent on one exact slice
 SLICE_SHARE = float(os.environ.get("BR_SLICE_SHARE", "0.75"))          # ... as a share of the cost of emitting the test
 SAMPLE_MIN_MS = int(os.environ.get("BR_SAMPLE_MIN_MS", "10000"))       # only tests this slow are ever sampled
 SAMPLE_MIN = int(os.environ.get("BR_SAMPLE_MIN", "3"))
