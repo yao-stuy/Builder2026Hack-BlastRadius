@@ -50,7 +50,6 @@ _SKIP_TOK = {
     tokenize.ENDMARKER,
     tokenize.ENCODING,
 }
-_SCOPE_GUARD_RE = re.compile(r"\b(?:global|nonlocal|import|__future__)\b")
 
 
 @dataclass
@@ -951,6 +950,23 @@ def _fast(path, old_text, new_text, fp, runs, ipts, added_text, shift) -> Impact
     return _lines_impact(old, router, runs, ipts, added_text, shift)
 
 
+def _scope_risky(nodes: list) -> bool:
+    """Statements outside function bodies whose compile-time validity may depend on the
+    rest of the module/class scope (function bodies are compiled exactly, as a whole)."""
+    stack = [n for n in nodes if not isinstance(n, _DEFS)]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, (ast.Global, ast.Nonlocal)):
+            return True
+        if isinstance(n, ast.ImportFrom) and (
+                n.module == "__future__" or any(a.name == "*" for a in n.names)):
+            return True
+        for c in ast.iter_child_nodes(n):
+            if not isinstance(c, _DEFS):
+                stack.append(c)
+    return False
+
+
 def _seg_has_code(lines: list[str], a: int, b: int) -> bool:
     for k in range(max(a, 1) - 1, min(b, len(lines))):
         s = lines[k].strip()
@@ -978,6 +994,12 @@ def _verify_region(old: _Index, g: _Region, new_lines: list[str], code_new: set[
     old_text = "\n".join(old.lines[g.s - 1:g.e])
     if "__future__" in text or "__future__" in old_text:
         raise _Fallback
+    if not text.strip():
+        # the region was deleted outright; fine unless it empties a class body
+        if g.chain and g.i == 0 and g.j == len(g.group) - 1:
+            raise _Fallback
+        g.new_nodes = []
+        return
     if ws:
         src = "if 1:\n" + text + "\n"
         off = g.ns - 2
@@ -998,11 +1020,8 @@ def _verify_region(old: _Index, g: _Region, new_lines: list[str], code_new: set[
                 raise _Fallback
         ast.increment_lineno(tree, off)
         compile(tree, "<region>", "exec", dont_inherit=True)
-    for n in nodes:
-        if not isinstance(n, _DEFS):
-            seg = "\n".join(new_lines[_start(n) - 1:n.end_lineno])
-            if _SCOPE_GUARD_RE.search(seg):
-                raise _Fallback
+    if _scope_risky(nodes):
+        raise _Fallback
     if ws and nodes and _ws_of(new_lines[_start(nodes[0]) - 1]) != ws:
         raise _Fallback
     g.new_nodes = nodes

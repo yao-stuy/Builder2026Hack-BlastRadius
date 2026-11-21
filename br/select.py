@@ -29,6 +29,8 @@ VERIFY_FACTOR = float(os.environ.get("BR_VERIFY_FACTOR", "0.8"))
 EST_SCALE = float(os.environ.get("BR_EST_SCALE", "0.5"))     # verify if est cpu <= factor * static cost
 DATA_STATIC = os.environ.get("BR_DATA_STATIC", "1") == "1"            # data-only patches: emit readers without verifying
 WARM = os.environ.get("BR_WARM", "1") == "1"                          # pre-import unpatched sqlglot core in the parent
+CLASS_NARROW = os.environ.get("BR_CLASS_NARROW", "1") == "1"          # class-body changes: only tests using the class
+CLASS_SPAN_MAX = int(os.environ.get("BR_CLASS_SPAN_MAX", "1500"))
 NEED_3P = ("tests/test_executor.py", "tests/test_optimizer.py")
 
 
@@ -103,6 +105,34 @@ def _read(path):
         return f.read()
 
 
+def _class_users(ctx, path, old_lines):
+    """A statement in a class body runs at import time, so every importer of the module "covers" it.
+    It can only matter to tests that use that class: tests that created an instance of it (or of a
+    subclass, or of a class of the same dialect family) or ran code inside the class body.
+    Returns None when this narrowing is not applicable."""
+    try:
+        out = set()
+        seen = set()
+        for ln in old_lines:
+            key = maps.class_at(path, ln)
+            if key is None or not maps.class_tracked(key):
+                return None
+            if key in seen:
+                continue
+            seen.add(key)
+            for fam in maps.class_family(key):
+                span = maps.class_span(fam)
+                fpath = fam.split("::")[0]
+                if span is None or span[1] - span[0] > CLASS_SPAN_MAX:
+                    return None
+                for l in range(span[0], span[1] + 1):
+                    out |= maps.tests_for(fpath, l, "fn")
+            out |= maps.tests_using_class(key)
+        return ctx.tr(out)
+    except Exception:
+        return None
+
+
 def analyze(ctx, text):
     """-> (candidates: set[int], certain: bool, changes: dict[path, bytes|None], notes: list[str])"""
     try:
@@ -172,9 +202,16 @@ def analyze(ctx, text):
                     notes.append(f"{p}: noop")
                 elif k == "lines":
                     kind = "fn" if imp.level == "fn" else "any"
-                    for ln in imp.old_lines:
-                        c |= ctx.tr(maps.tests_for(old_p, ln, kind))
-                    notes.append(f"{p}: lines/{imp.level} {sorted(imp.old_lines)[:6]} -> {len(c)}")
+                    narrowed = None
+                    if imp.level == "top" and CLASS_NARROW:
+                        narrowed = _class_users(ctx, old_p, imp.old_lines)
+                    if narrowed is not None:
+                        c |= narrowed
+                    else:
+                        for ln in imp.old_lines:
+                            c |= ctx.tr(maps.tests_for(old_p, ln, kind))
+                    notes.append(f"{p}: lines/{imp.level}{'/cls' if narrowed is not None else ''} "
+                                 f"{sorted(imp.old_lines)[:6]} -> {len(c)}")
                 elif k == "syntax_error":
                     c |= ctx.tr(maps.tests_for_file(old_p, "any"))
                     certain = certain or bool(c)
@@ -219,6 +256,12 @@ def _engine(ctx):
     return ctx.verifier, ctx.mirror
 
 
+def _cost(ctx, nums):
+    if not nums:
+        return 0.0
+    return pack.cost_of_ms(pack.best([(n, ctx.ms[n]) for n in nums]), ctx.ms) / 1000
+
+
 def decide(ctx, commit, text, deadline):
     cand, certain, changes, notes, py_impact = analyze(ctx, text)
     info = {"cand": len(cand), "notes": notes, "verified": 0, "cpu": 0.0, "how": ""}
@@ -235,11 +278,14 @@ def decide(ctx, commit, text, deadline):
     heavy = {n for n in cand if ctx.ms[n] >= HEAVY_MS}
     unrel = (cand - heavy) & ctx.unreliable
     light = cand - heavy - unrel
-    static_cost = pack.cost_of_ms(pack.best([(n, ctx.ms[n]) for n in cand]), ctx.ms) / 1000
+    static_cost = _cost(ctx, cand)
+    # What we would still have to emit if every light candidate passes.
+    residual = set(unrel) | (heavy if HEAVY_WHEN_CLEAN == "include" else set())
+    gain = static_cost - _cost(ctx, residual)
     est = ctx.est(light)
-    if (not VERIFY or not light or est > MAX_VERIFY_CPU or est > VERIFY_FACTOR * static_cost
+    if (not VERIFY or not light or est > MAX_VERIFY_CPU or est > VERIFY_FACTOR * gain
             or time.time() + est * 2 + 5 > deadline):
-        info["how"] = f"static (est {est:.1f}s vs {static_cost:.1f}s)"
+        info["how"] = f"static (est {est:.1f}s vs gain {gain:.1f}s of {static_cost:.1f}s)"
         return cand, info
 
     ver, mir = _engine(ctx)

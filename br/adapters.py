@@ -279,8 +279,8 @@ def install_executor_lazy():
 # ======================================================================================== B. max_nodes
 
 _MN_TARGET = ("tests.test_parser", "TestParser", "test_max_nodes")
-_MN_SCALE = {10000: 120, 1_000_000: 12_000, 50_000: 600}
-_MN_MSG = ("(50000)", "(600)")
+_MN_SCALE = {10000: 60, 1_000_000: 6_000, 50_000: 300}
+_MN_MSG = ("(50000)", "(300)")
 
 
 class _Scale(ast.NodeTransformer):
