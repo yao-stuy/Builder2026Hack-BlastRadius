@@ -52,7 +52,9 @@ def main():
     answers = {}
     try:
         from br import select  # the real selector; absent in the bootstrap version
-        answers = select.run(DATA, tests, commits, deadline=T0 + float(os.environ.get("BR_BUDGET_S", "150")), log=log)
+        # The whole batch has 3 minutes (4.5 in the final, which has about 1.5x as many commits).
+        budget = float(os.environ.get("BR_BUDGET_S", "0")) or (140.0 if len(commits) <= 46 else 215.0)
+        answers = select.run(DATA, tests, commits, deadline=T0 + budget, log=log)
     except Exception as e:  # noqa: BLE001
         log("selector unavailable or failed, using full suite:", repr(e))
 

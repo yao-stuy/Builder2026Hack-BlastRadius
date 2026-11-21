@@ -27,18 +27,20 @@ TMP = os.environ.get("BR_TMP", "/tmp/br")
 HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", "2500"))          # tests at least this long are never run by us
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"               # dynamic verification on/off
 HEAVY_WHEN_CLEAN = os.environ.get("BR_HEAVY_WHEN_CLEAN", "include")  # include | exclude
-MAX_VERIFY_CPU = float(os.environ.get("BR_MAX_VERIFY_CPU", "20"))     # per-commit cap on estimated verify CPU
-VERIFY_FACTOR = float(os.environ.get("BR_VERIFY_FACTOR", "0.8"))
-EST_SCALE = float(os.environ.get("BR_EST_SCALE", "0.5"))     # verify if est cpu <= factor * static cost
+MAX_VERIFY_CPU = float(os.environ.get("BR_MAX_VERIFY_CPU", "12"))     # per-commit cap on estimated verify CPU
+VERIFY_FACTOR = float(os.environ.get("BR_VERIFY_FACTOR", "1.0"))
+# Estimates are in seconds of the scoring machine, which runs about 3x faster than the recording machine.
+EST_SCALE = float(os.environ.get("BR_EST_SCALE", "0.15"))     # verify if est cpu <= factor * static cost
 DATA_STATIC = os.environ.get("BR_DATA_STATIC", "1") == "1"            # data-only patches: emit readers without verifying
 WARM = os.environ.get("BR_WARM", "1") == "1"                          # pre-import unpatched sqlglot core in the parent
 CLASS_NARROW = os.environ.get("BR_CLASS_NARROW", "1") == "1"          # class-body changes: only tests using the class
 CLASS_SPAN_MAX = int(os.environ.get("BR_CLASS_SPAN_MAX", "1500"))
 REF_NARROW = os.environ.get("BR_REF_NARROW", "1") == "1"              # constant assignments: only tests running code that mentions the name
 SLICE = os.environ.get("BR_SLICE", "1") == "1"                        # run only the affected fixture entries of loop tests
-MAX_TEST_CPU = float(os.environ.get("BR_MAX_TEST_CPU", "4"))           # a single test costing more than this is not run by us
+MAX_TEST_CPU = float(os.environ.get("BR_MAX_TEST_CPU", "1.5"))           # a single test costing more than this is not run by us
 SAMPLE = os.environ.get("BR_SAMPLE", "1") == "1"                      # sample entries of loop tests too expensive to verify
-SAMPLE_CPU = float(os.environ.get("BR_SAMPLE_CPU", "1.5"))
+SAMPLE_CPU = float(os.environ.get("BR_SAMPLE_CPU", "0.5"))
+SAMPLE_TRUST = os.environ.get("BR_SAMPLE_TRUST", "1") == "1"          # drop a sampled test whenever its sample passes
 SAMPLE_MIN = int(os.environ.get("BR_SAMPLE_MIN", "6"))
 ADAPT = os.environ.get("BR_ADAPT", "1") == "1"                        # cheap stand-ins for the slowest tests
 MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
@@ -47,6 +49,7 @@ EXECUTOR = "tests/test_executor.py::TestExecutor"
 NO_RUN = set() if ADAPT else {MAX_NODES}
 DUCK1 = os.environ.get("BR_DUCK1", "0") == "1"
 DEBUG = os.environ.get("BR_DEBUG", "0") == "1"
+KEY_NARROW = os.environ.get("BR_KEY_NARROW", "0") == "1"              # table entries keyed by expression class
 NEED_3P = ("tests/test_executor.py", "tests/test_optimizer.py")
 
 
@@ -232,6 +235,71 @@ def _ref_users(ctx, path, old_text, old_lines):
         return None
 
 
+_EXPR = None
+
+
+def _expr_classes():
+    """Expression class name -> class key, for names that are unique among sqlglot/expressions classes."""
+    global _EXPR
+    if _EXPR is None:
+        seen = {}
+        for key in maps._load_cls()[0]:
+            f, q = key.split("::")
+            if f.startswith("sqlglot/expressions/") and "." not in q:
+                seen.setdefault(q, []).append(key)
+        _EXPR = {q: ks[0] for q, ks in seen.items() if len(ks) == 1}
+    return _EXPR
+
+
+def _key_users(ctx, old_text, old_lines):
+    """The change is inside entries of a class-level table keyed by expression classes
+    (e.g. TRANSFORMS = {exp.Foo: ...}). An entry only matters when its key is looked up, which needs an
+    instance of that expression class: tests that created one. None when not of that form."""
+    try:
+        tree = ast.parse(old_text)
+        lines = set(old_lines)
+        keys = set()
+        covered = set()
+        todo = [tree]
+        while todo:
+            node = todo.pop()
+            for st in getattr(node, "body", []):
+                lo, hi = st.lineno, getattr(st, "end_lineno", st.lineno)
+                if not any(lo <= ln <= hi for ln in lines):
+                    continue
+                if isinstance(st, ast.ClassDef):
+                    todo.append(st)
+                    continue
+                val = st.value if isinstance(st, (ast.Assign, ast.AnnAssign)) else None
+                if not isinstance(val, ast.Dict):
+                    return None
+                for k, v in zip(val.keys, val.values):
+                    if k is None:           # **spread of another table
+                        klo, khi = v.lineno, v.end_lineno
+                        if any(klo <= ln <= khi for ln in lines):
+                            return None
+                        continue
+                    klo, khi = k.lineno, v.end_lineno
+                    hit = {ln for ln in lines if klo <= ln <= khi}
+                    if not hit:
+                        continue
+                    if not (isinstance(k, ast.Attribute) and isinstance(k.value, ast.Name) and k.value.id == "exp"):
+                        return None
+                    ck = _expr_classes().get(k.attr)
+                    if ck is None or not maps.class_tracked(ck):
+                        return None
+                    keys.add(ck)
+                    covered |= hit
+        if not keys or covered != lines:
+            return None
+        out = set()
+        for ck in keys:
+            out |= maps.tests_using_class(ck)
+        return ctx.tr(out)
+    except Exception:
+        return None
+
+
 def analyze(ctx, text):
     """-> (candidates: set[int], certain: bool, changes: dict[path, bytes|None], notes: list[str])"""
     try:
@@ -328,12 +396,19 @@ def analyze(ctx, text):
                             cc = cc & (refs[0] | refs[1])
                             if refs[2]:
                                 cc |= anyc
-                    if level == "top" and (narrowed is not None or refs is not None):
+                    keyed = None
+                    if level == "top" and KEY_NARROW and cc:
+                        raw = diffparse.removed_old_lines(fp)   # the edited lines themselves, not the whole statement
+                        keyed = _key_users(ctx, old_text, raw) if raw else None
+                        if keyed is not None:
+                            cc &= keyed
+                    if level == "top" and (narrowed is not None or refs is not None or keyed is not None):
                         probes.append(old_p)   # narrowing assumes the module still imports: check that
                     c |= cc
                     impacts.append((old_p, sorted(imp.old_lines), "fn") if level == "fn" else (old_p, [], None))
                     notes.append(f"{p}: lines/{level}{'/cls' if narrowed is not None else ''}"
-                                 f"{'/ref' if refs is not None else ''} {sorted(imp.old_lines)[:6]} -> {len(cc)}")
+                                 f"{'/ref' if refs is not None else ''}{'/key' if keyed is not None else ''} "
+                                 f"{sorted(imp.old_lines)[:6]} -> {len(cc)}")
                 elif k == "syntax_error":
                     c |= ctx.tr(maps.tests_for_file(old_p, "any"))
                     certain = certain or bool(c)
@@ -462,7 +537,10 @@ def _slice_plan(ctx, n, impacts, data):
             for ln in lines:
                 if entrymaps.needs_full(n, path, ln, kind):
                     return 1.0, None
-                for fx, s in entrymaps.entries(n, path, ln, kind).items():
+                found = entrymaps.entries(n, path, ln, kind)
+                if not found and n in ctx.tr(maps.tests_for(path, ln, kind)):
+                    return 1.0, None   # the test runs this line but no recorded entry does: do not slice
+                for fx, s in found.items():
                     sel[fx] |= s
             evidence = True
         for path, texts in data.items():
@@ -531,6 +609,21 @@ def _probe_only(ctx, changes, deadline):
         mir.restore()
     ctx.cpu_spent += res.cpu_s
     return _importers(ctx, [p for i, p in zip(ids, probes) if res.results.get(i) != "pass"])
+
+
+def _related(ctx, n, others):
+    try:
+        fx = set(entrymaps.sliceable(n) or ())
+        for o in others:
+            if o == n:
+                continue
+            if ctx.cls_of[o] == ctx.cls_of[n]:
+                return True
+            if fx & set(entrymaps.sliceable(o) or ()):
+                return True
+        return False
+    except Exception:
+        return True
 
 
 def _gm_dialects(impacts, data):
@@ -618,14 +711,14 @@ def decide(ctx, commit, text, deadline):
         if ADAPT and tid == MAX_NODES:
             # a scaled-down copy of the test body (same structure, ~170x less work)
             plan[n] = None
-            vcost[n] = 0.5
+            vcost[n] = 0.15
             specials[tid] = adapters.max_nodes_proxy
             continue
         if ADAPT and tid == GEN_MEM:
             # the test loops over dialects; run only the dialects whose code the change touches
             dl = _gm_dialects(impacts, data)
             plan[n] = None
-            vcost[n] = 2.3 if dl is None else 0.1 + 0.22 * len(dl)
+            vcost[n] = 0.7 if dl is None else 0.03 + 0.07 * len(dl)
             specials[tid] = (lambda dl=dl: adapters.generator_memory_run(dl))
             continue
         frac, sel = _slice_plan(ctx, n, impacts, data)
@@ -642,7 +735,7 @@ def decide(ctx, commit, text, deadline):
                 sampled.add(n)
 
     def est(vs):
-        return 0.05 + sum(vcost[n] for n in vs) + EST_SCALE * sum(ctx.fixcost[c] for c in {ctx.cls_of[n] for n in vs})
+        return 0.02 + sum(vcost[n] for n in vs) + EST_SCALE * sum(ctx.fixcost[c] for c in {ctx.cls_of[n] for n in vs})
 
     # Leave out of verification the tests that cost more to run than to simply emit.
     V = set(vcost)
@@ -657,7 +750,7 @@ def decide(ctx, commit, text, deadline):
     gain = static_cost - _cost(ctx, U)
     e = est(V)
     if (not VERIFY or not V or e > MAX_VERIFY_CPU or e > VERIFY_FACTOR * gain
-            or time.time() + e * 2 + 5 > deadline):
+            or time.time() + e * 4 + 5 > deadline):
         info["how"] = f"static (est {e:.1f}s vs gain {gain:.1f}s of {static_cost:.1f}s)"
         return cand | _probe_only(ctx, changes, deadline), info
 
@@ -692,7 +785,7 @@ def decide(ctx, commit, text, deadline):
     if any(ctx.file_of[n] in NEED_3P for n in order):
         ver.ensure_preloaded(("duckdb", "pandas", "numpy"))
     timeouts = {ctx.ids[n]: max(3.0, 8 * ctx.cpu[n]) for n in order}
-    wall = min(max(10.0, e * 6 + 10), max(1.0, deadline - time.time() - 3))
+    wall = min(max(10.0, e * 12 + 10), max(1.0, deadline - time.time() - 3))
 
     lazy = ADAPT and any(ctx.cls_of[n] == EXECUTOR for n in V)
 
@@ -757,8 +850,9 @@ def decide(ctx, commit, text, deadline):
     info["cpu"] = res.cpu_s
     info["verified"] = len(res.results)
     broken = [p for p in ctx.probes if res.results.pop("probe::" + p, None) != "pass"]
-    passed = {ctx.num[i] for i, o in res.results.items() if o == "pass"}
-    failed = {ctx.num[i] for i, o in res.results.items() if o != "pass"}
+    # ids we did not ask for (helper test cases run by stand-ins) are ignored
+    passed = {ctx.num[i] for i, o in res.results.items() if o == "pass" and i in ctx.num}
+    failed = {ctx.num[i] for i, o in res.results.items() if o != "pass" and i in ctx.num}
     pending = set(order) - passed - failed  # not run, or in progress when the child died
     if broken:
         info["how"] = "module no longer imports (or the check did not finish)"
@@ -767,14 +861,23 @@ def decide(ctx, commit, text, deadline):
         ctx.log(f"   child problem: died={res.died} timed_out={res.timed_out} error={res.error} suspect={res.suspect}")
     if DEBUG and res.cpu_s > 2:
         top = sorted(res.cpus.items(), key=lambda kv: -kv[1])[:8]
-        ctx.log("   cpu by test: " + ", ".join(f"{t.split('::')[-1]}={c:.2f}(est {vcost.get(ctx.num[t], 0):.2f})" for t, c in top)
+        ctx.log("   cpu by test: " + ", ".join(f"{t.split('::')[-1]}={c:.2f}(est {vcost.get(ctx.num.get(t), 0):.2f})" for t, c in top)
                 + f" | sum {sum(res.cpus.values()):.1f} of {res.cpu_s:.1f}")
     nsl = sum(1 for n in V if plan[n] is not None)
     if failed or pending:
         # A sampled test that passed its sample is still emitted when something else failed.
         info["how"] = (f"fail found ({len(failed)} failed, {len(pending)} unverified, {len(U)} not run, "
                        f"{nsl} sliced, {len(sampled)} sampled, est {e:.1f}s)")
-        return failed | pending | U | sampled, info
+        # A sampled test whose sample passed is dropped unless a failed test is closely related to it
+        # (same test class, or driven by the same fixture file): then its own failure is likely.
+        keep = set()
+        for n in sampled:
+            if n not in passed or not SAMPLE_TRUST or _related(ctx, n, failed | pending):
+                keep.add(n)
+        if DEBUG:
+            ctx.log("   failed: " + ", ".join(ctx.ids[n].split("::")[-1] for n in sorted(failed))[:300]
+                    + " | sampled passed: " + ", ".join(ctx.ids[n].split("::")[-1] for n in sorted(sampled & passed)))
+        return failed | pending | U | keep, info
     info["how"] = f"clean ({len(passed)} passed, {len(U)} not run, {nsl} sliced, {len(sampled)} sampled, est {e:.1f}s)"
     return set(U), info
 
