@@ -53,6 +53,11 @@ EXECUTOR = "tests/test_executor.py::TestExecutor"
 POOL_CLASSES = {EXECUTOR, "tests/test_optimizer.py::TestOptimizer"}
 REC_SCALE = float(os.environ.get("BR_REC_SCALE", "0.85"))              # our CPU per recorded second, ordinary tests
 NO_RUN = set() if ADAPT else {MAX_NODES}
+# EXPERIMENT (never the final entry): the three TPC executor tests are emitted when they are candidates, never
+# run by us. Measures how much of the scoring machine's CPU their verification accounts for.
+if os.environ.get("BR_EXP_NOPOOL", "1") == "1":
+    NO_RUN = NO_RUN | {EXECUTOR + "::test_execute_tpcds", EXECUTOR + "::test_execute_tpch",
+                       EXECUTOR + "::test_optimized_tpch"}
 DUCK1 = os.environ.get("BR_DUCK1", "0") == "1"
 CONTINUE = os.environ.get("BR_CONTINUE", "1") == "1"                  # keep verifying after a failure when it pays
 CONT_FACTOR = float(os.environ.get("BR_CONT_FACTOR", "0.6"))
