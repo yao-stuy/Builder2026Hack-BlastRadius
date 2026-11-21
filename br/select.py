@@ -1,0 +1,260 @@
+"""Per-commit test selection.
+
+For each commit:
+  1. parse the patch and work out, from maps built at the pinned commit (line coverage, file reads),
+     which tests could possibly be affected (the candidates);
+  2. when it is cheap enough, apply the patch to a mirror of the sources and run candidates with our
+     own unittest runner to see what really fails;
+  3. emit the failing test plus every candidate we did not verify, packed over workers.
+
+Anything unexpected widens the answer (up to the full suite); nothing here may guess low.
+"""
+from __future__ import annotations
+
+import os
+import time
+
+from br import classify, diffparse, maps, pack
+
+ROOT = os.environ.get("BR_SQLGLOT", "/opt/sqlglot")
+MAPS = os.environ.get("BR_MAPS", "/app/maps")
+TMP = os.environ.get("BR_TMP", "/tmp/br")
+
+# ---- tunables (generic thresholds; tuned on our own mutation benchmark) -----------------------
+HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", "2500"))          # tests at least this long are never run by us
+VERIFY = os.environ.get("BR_VERIFY", "1") == "1"               # dynamic verification on/off
+HEAVY_WHEN_CLEAN = os.environ.get("BR_HEAVY_WHEN_CLEAN", "include")  # include | exclude
+MAX_VERIFY_CPU = float(os.environ.get("BR_MAX_VERIFY_CPU", "8"))     # per-commit cap on estimated verify CPU
+VERIFY_FACTOR = float(os.environ.get("BR_VERIFY_FACTOR", "1.0"))     # verify if est cpu <= factor * static cost
+NEED_3P = ("tests/test_executor.py", "tests/test_optimizer.py")
+
+
+class Full(Exception):
+    """Give up on precision for this commit: run the whole suite."""
+
+
+class Ctx:
+    def __init__(self, tests, log):
+        self.log = log
+        self.tests = tests
+        self.ids = [t["id"] for t in tests]
+        self.num = {t["id"]: t["number"] for t in tests}
+        self.ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+        self.file_of = {t["number"]: t["file"] for t in tests}
+        self.all = frozenset(self.ms)
+        maps.load(MAPS)
+        mids = maps.test_ids()
+        # maps are indexed by the test numbering at record time; translate if tests.json differs
+        self.same = mids == self.ids
+        self.m2n = None if self.same else {i: self.num[x] for i, x in enumerate(mids) if x in self.num}
+        self.unmapped = frozenset() if self.same else frozenset(self.num[x] for x in self.ids if x not in set(mids))
+        try:
+            cpu = maps.test_cpu()
+        except Exception:
+            cpu = None
+        self.cpu = {}
+        for n in self.all:
+            c = None
+            if cpu is not None:
+                try:
+                    i = n if self.same else mids.index(self.ids[n])
+                    c = cpu[i]
+                except Exception:
+                    c = None
+            self.cpu[n] = float(c) if c is not None else self.ms[n] / 1000 * 1.5 + 0.002
+        try:
+            self.unreliable = self.tr(maps.isolated_failures())
+        except Exception:
+            self.unreliable = frozenset()
+        self.verifier = None
+        self.mirror = None
+        self.cpu_spent = 0.0
+
+    def tr(self, s):
+        """Translate a set of map test numbers into tests.json numbers."""
+        if self.same:
+            return frozenset(s)
+        return frozenset(self.m2n[i] for i in s if i in self.m2n)
+
+
+def _read(path):
+    with open(os.path.join(ROOT, path), "rb") as f:
+        return f.read()
+
+
+def analyze(ctx, text):
+    """-> (candidates: set[int], certain: bool, changes: dict[path, bytes|None], notes: list[str])"""
+    try:
+        fps = diffparse.parse(text)
+    except diffparse.PatchError as e:
+        raise Full(f"unparseable patch: {e}")
+    if not fps:
+        raise Full("empty patch")
+    cand = set(ctx.unmapped)
+    certain = False
+    changes = {}
+    notes = []
+    for fp in fps:
+        old_p, new_p = fp.old_path, fp.new_path
+        p = old_p or new_p
+        if p is None:
+            raise Full("no path")
+        is_py = p.endswith(".py") or (new_p or "").endswith(".py")
+        if fp.binary:
+            readers = ctx.tr(maps.tests_reading(p)) if old_p else frozenset()
+            if readers or maps.known_file(p) or is_py:
+                raise Full(f"binary change to {p}")
+            notes.append(f"{p}: binary, unread")
+            continue
+        if fp.mode_only:
+            notes.append(f"{p}: mode only")
+            continue
+        # old/new contents
+        old_text = None
+        if old_p is not None and fp.status != "add":
+            try:
+                old_text = _read(old_p).decode("utf-8")
+            except FileNotFoundError:
+                raise Full(f"{old_p} not in pinned tree")
+            except UnicodeDecodeError:
+                raise Full(f"{old_p} not utf-8")
+        try:
+            new_text = None if fp.status == "delete" else diffparse.apply(fp, old_text)
+        except diffparse.PatchError as e:
+            raise Full(f"patch does not apply to {p}: {e}")
+        if fp.status == "delete":
+            changes[old_p] = None
+        else:
+            if fp.status == "rename" and not fp.copy and old_p != new_p:
+                changes[old_p] = None
+            changes[new_p] = new_text.encode("utf-8")
+
+        # which tests can this file change affect?
+        c = set()
+        if old_p is not None:
+            c |= ctx.tr(maps.tests_reading(old_p))      # tests that open the file as data
+        for q in {old_p, new_p} - {None}:
+            d = os.path.dirname(q)
+            if fp.status != "modify":
+                c |= ctx.tr(maps.tests_reading("dir:" + d))  # tests that list the directory
+        if is_py:
+            if fp.status != "modify":
+                if old_p is not None:
+                    c |= ctx.tr(maps.tests_for_file(old_p, "any"))
+                    certain = certain or bool(c)
+                notes.append(f"{p}: {fp.status} ({len(c)})")
+            else:
+                imp = classify.classify(old_p, old_text, new_text, fp)
+                k = imp.kind
+                if k == "noop":
+                    notes.append(f"{p}: noop")
+                elif k == "lines":
+                    kind = "fn" if imp.level == "fn" else "any"
+                    for ln in imp.old_lines:
+                        c |= ctx.tr(maps.tests_for(old_p, ln, kind))
+                    notes.append(f"{p}: lines/{imp.level} {sorted(imp.old_lines)[:6]} -> {len(c)}")
+                elif k == "syntax_error":
+                    c |= ctx.tr(maps.tests_for_file(old_p, "any"))
+                    certain = certain or bool(c)
+                    notes.append(f"{p}: syntax error ({len(c)})")
+                else:  # whole_file or anything unexpected
+                    c |= ctx.tr(maps.tests_for_file(old_p, "any"))
+                    notes.append(f"{p}: {k} {imp.reason[:40]} ({len(c)})")
+        else:
+            notes.append(f"{p}: data file ({len(c)})")
+        cand |= c
+    return cand, certain, changes, notes
+
+
+def _order(ctx, light, changes):
+    """Cheap tests first, but tests whose file name matches a changed file's name go to the front."""
+    stems = set()
+    for p in changes:
+        s = os.path.basename(p).rsplit(".", 1)[0].lower()
+        if len(s) > 2:
+            stems.add(s)
+
+    def key(n):
+        f = ctx.file_of[n].lower()
+        related = any(s in f for s in stems)
+        return (0 if related else 1, ctx.cpu[n])
+
+    return sorted(light, key=key)
+
+
+def _engine(ctx):
+    if ctx.verifier is None:
+        from br import engine, overlay
+        os.makedirs(TMP, exist_ok=True)
+        ctx.mirror = overlay.Mirror(ROOT, os.path.join(TMP, "m"))
+        ctx.mirror.build()
+        ctx.verifier = engine.Verifier(os.path.join(TMP, "m"), preload=("unittest", "json", "concurrent.futures"))
+    return ctx.verifier, ctx.mirror
+
+
+def decide(ctx, commit, text, deadline):
+    cand, certain, changes, notes = analyze(ctx, text)
+    info = {"cand": len(cand), "notes": notes, "verified": 0, "cpu": 0.0, "how": ""}
+    if not cand:
+        info["how"] = "no candidates"
+        return set(), info
+    if certain:
+        info["how"] = "certain"
+        return cand, info
+    heavy = {n for n in cand if ctx.ms[n] >= HEAVY_MS}
+    unrel = (cand - heavy) & ctx.unreliable
+    light = cand - heavy - unrel
+    static_cost = pack.cost_of_ms(pack.best([(n, ctx.ms[n]) for n in cand]), ctx.ms) / 1000
+    est = sum(ctx.cpu[n] for n in light) + 0.3
+    if (not VERIFY or not light or est > MAX_VERIFY_CPU or est > VERIFY_FACTOR * static_cost
+            or time.time() + est * 2 + 5 > deadline):
+        info["how"] = f"static (est {est:.1f}s vs {static_cost:.1f}s)"
+        return cand, info
+
+    ver, mir = _engine(ctx)
+    order = _order(ctx, light, changes)
+    ids = [ctx.ids[n] for n in order]
+    if any(ctx.file_of[n] in NEED_3P for n in order):
+        ver.ensure_preloaded(("duckdb", "pandas", "numpy"))
+    timeouts = {ctx.ids[n]: max(3.0, 8 * ctx.cpu[n]) for n in order}
+    wall = min(max(10.0, est * 6 + 10), max(1.0, deadline - time.time() - 3))
+    try:
+        mir.apply(changes)
+        res = ver.verify(ids, stop_on_fail=True, timeouts=timeouts, wall_s=wall)
+    finally:
+        mir.restore()
+    ctx.cpu_spent += res.cpu_s
+    info["cpu"] = res.cpu_s
+    info["verified"] = len(res.results)
+    passed = {ctx.num[i] for i, o in res.results.items() if o == "pass"}
+    failed = {ctx.num[i] for i, o in res.results.items() if o != "pass"}
+    pending = set(order) - passed - failed  # not run, or in progress when the child died
+    if failed or pending:
+        info["how"] = f"fail found ({len(failed)} failed, {len(pending)} unverified)"
+        return failed | pending | heavy | unrel, info
+    sel = set(unrel)
+    if heavy and HEAVY_WHEN_CLEAN == "include":
+        sel |= heavy
+    info["how"] = f"clean ({len(passed)} passed, heavy {len(heavy)} {HEAVY_WHEN_CLEAN})"
+    return sel, info
+
+
+def run(data_dir, tests, commits, deadline, log):
+    ctx = Ctx(tests, log)
+    full = None
+    answers = {}
+    for c in commits:
+        t0 = time.time()
+        try:
+            with open(os.path.join(data_dir, "commits", c + ".patch"), "rb") as f:
+                text = f.read().decode("utf-8", errors="surrogateescape")
+            sel, info = decide(ctx, c, text, deadline)
+            answers[c] = pack.best([(n, ctx.ms[n]) for n in sorted(sel)])
+            log(f"{c}: {len(sel)} tests | {info['how']} | cand {info['cand']} verified {info['verified']} "
+                f"cpu {info['cpu']:.2f}s wall {time.time() - t0:.2f}s | {'; '.join(info['notes'])[:200]}")
+        except Full as e:
+            log(f"{c}: FULL SUITE ({e})")
+        except Exception as e:  # noqa: BLE001
+            log(f"{c}: FULL SUITE (internal error {e!r})")
+    log(f"verify cpu total {ctx.cpu_spent:.2f}s")
+    return answers
