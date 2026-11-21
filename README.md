@@ -24,6 +24,13 @@ what really fails.
      dialect, or that ran code in the class body.
    - *Constant references.* For a plain `NAME = value` assignment, only tests that run code mentioning
      `NAME`.
+   - *Equivalent comparisons* (`br/cmptypes.py`). If the only edit is `is` exchanged with `==` (or
+     `is not` with `!=`), the change is a no-op whenever the two operators are the same function for every
+     operand that can reach it. The operand types seen at each comparison were recorded at the pinned
+     commit; the swap is accepted only if they are always `None` against a type whose `__eq__` falls back
+     to identity for `None`, or always two members of the same plain `Enum`. This is a proof from Python
+     semantics that the patched program computes the same values, not a prediction of which tests break;
+     if any site is not proven, the tests are run as usual. `BR_ISEQ=0` turns it off.
    - Anything else (module-level edits we cannot narrow, renamed or deleted files, unparseable input)
      falls back to every test that loads the file, and finally to the whole suite.
 3. **Verification** (`br/engine.py`, `br/harness.py`, `br/overlay.py`). When the estimated CPU cost is lower
@@ -52,6 +59,7 @@ Everything under `maps/` is generated from the pinned commit only, by the script
 | `classes.json.z`, `uses.bin` | class table and which tests instantiate which classes | `tools/classhook.py`, `tools/classtable.py` |
 | `refs.json.z` | where constant-style names are read | `tools/build_refs.py` |
 | `entries.bin`, `entries.idx.json` | per-fixture-entry coverage of loop tests | `tools/record_entries.py` |
+| `cmptypes.json.z` | operand types seen at each comparison, and whether each type compares by identity | `tools/record_types.py` |
 | `adapters.json`, `adapters.json.z` | source hashes and per-dialect coverage for the stand-ins | `tools/record_adapters.py` |
 
 `tools/mutgen.py`, `tools/recall.py`, `tools/eval.py` and `tools/labelplan.py` are for local validation on
