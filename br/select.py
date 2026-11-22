@@ -55,7 +55,7 @@ REC_SCALE = float(os.environ.get("BR_REC_SCALE", "0.85"))              # our CPU
 NO_RUN = set() if ADAPT else {MAX_NODES}
 # EXPERIMENT (never the final entry): the three TPC executor tests are emitted when they are candidates, never
 # run by us. Measures how much of the scoring machine's CPU their verification accounts for.
-if os.environ.get("BR_EXP_NOPOOL", "1") == "1":
+if os.environ.get("BR_EXP_NOPOOL", "0") == "1":
     NO_RUN = NO_RUN | {EXECUTOR + "::test_execute_tpcds", EXECUTOR + "::test_execute_tpch",
                        EXECUTOR + "::test_optimized_tpch"}
 DUCK1 = os.environ.get("BR_DUCK1", "0") == "1"
@@ -1092,6 +1092,10 @@ def decide(ctx, commit, text, deadline):
     gain = static_cost - _cost(ctx, U)
     e = est(V)
     too_much = (e > AUDIT_CAP) if AUDIT else (e > MAX_VERIFY_CPU or e > VERIFY_FACTOR * gain)
+    # EXPERIMENT (never the final entry): no verification for import-time (module/class-level) changes whose
+    # check is estimated above 2 s. Measures the share of such changes in the scoring machine's CPU.
+    if os.environ.get("BR_EXP_NOCLS", "1") == "1" and e > 2.0 and any(": lines/top" in x for x in notes):
+        too_much = True
     if (not VERIFY or not V or too_much or time.time() + e * 4 + 5 > deadline):
         info["how"] = f"static (est {e:.1f}s vs gain {gain:.1f}s of {static_cost:.1f}s)"
         return cand | _probe_only(ctx, changes, deadline), info
